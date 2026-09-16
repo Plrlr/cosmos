@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Cosmos</string>
+    <string name="loading_title">Loading, please wait…</string>
+    <string name="loading_subtitle">Generating your news brief…</string>
+    <string name="error_title">Couldn\'t generate your news brief</string>
+    <string name="error_no_report">The pipeline finished, but no HTML report was found in the output directory:</string>
+</resources>

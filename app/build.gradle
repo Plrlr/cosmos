@@ -1,0 +1,56 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'com.chaquo.python'
+}
+
+android {
+    namespace 'com.cosmos.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.cosmos.app"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+
+        ndk {
+            // Chaquopy ships a Python build per ABI; include the four common
+            // ones so the APK runs on physical devices and emulators alike.
+            abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
+        }
+
+        python {
+            // `version` selects the Python runtime bundled into the APK (the
+            // package needs 3.10+; 3.11 is the Chaquopy-supported pick,
+            // Chaquopy 15.0 supports 3.8-3.12). Chaquopy downloads the Python
+            // builds per ABI on the first build, so the first sync needs
+            // network access. No pip packages are used (stdlib-only), so no
+            // `buildPython` (build-time interpreter) is needed.
+            version "3.11"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+// No dependencies: the app uses only framework widgets (Activity, WebView,
+// ProgressBar, TextView) plus Chaquopy's com.chaquo.python.Python API, which
+// the Chaquopy plugin adds automatically. Kotlin stdlib is auto-added by the
+// Kotlin plugin. The Python package has zero third-party deps, so no pip
+// configuration either.

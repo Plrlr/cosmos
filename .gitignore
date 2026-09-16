@@ -1,0 +1,18 @@
+# Gradle build outputs and IDE/local state. Nothing in this list is part of
+# the committed project; generate them locally (see README.md).
+.gradle/
+build/
+app/build/
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
