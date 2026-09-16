@@ -7,6 +7,7 @@ import android.webkit.WebView
 import android.widget.ProgressBar
 import android.widget.TextView
 import com.chaquo.python.Python
+import com.chaquo.python.android.AndroidPlatform
 import java.io.File
 
 /**
@@ -63,6 +64,12 @@ class MainActivity : Activity() {
         // a relative "reports/" dir, so always pass the absolute path.
         val outputDir = File(filesDir, "reports")
         val result = try {
+            // Chaquopy must be told it is running on Android before any other
+            // Python API is touched; without this it falls back to
+            // GenericPlatform and throws at Python.getInstance().
+            if (!Python.isStarted()) {
+                Python.start(AndroidPlatform(this))
+            }
             val runner = Python.getInstance().getModule("runner")
             runner.callAttr("run", outputDir.absolutePath, 12, 8).toString()
         } catch (t: Throwable) {
