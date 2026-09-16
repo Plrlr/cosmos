@@ -780,11 +780,92 @@ def _ray_to_frame(direction: tuple[float, float], frame: tuple[float, float, flo
     low_x, low_y, span_x, span_y = frame
     high_x, high_y = low_x + span_x, low_y + span_y
     factors = []
-    for component, low, high in ((direction[0], low_x, high_x), (direction[1], low_y, high_y)):
+    for component, low, high in ((direction[0], low_x, high_x), (direction[1], low_y, low_y + span_y)):
         if abs(component) > 1e-12:
             factors.append(((high if component > 0 else low)) / component)
     factor = min(factors) if factors else 0.0
     return direction[0] * factor, direction[1] * factor
+
+
+#: Nested iso-contours drawn around the origin, as fractions of the selection
+#: surface's outline radius. They suggest the curvature of the manifold the
+#: ranking ball lives on; the outermost ring sits just inside the real surface.
+MANIFOLD_RINGS: tuple[float, ...] = (0.24, 0.46, 0.67, 0.85)
+
+
+def _angular_outline(
+    points_xy: Sequence[tuple[float, float]],
+    origin: tuple[float, float],
+    bins: int = 72,
+) -> list[tuple[float, float]]:
+    """Radial outline ``(angle, radius)`` of a projected region about ``origin``.
+
+    The trust surface is radial in the cube and the isometric projection is
+    linear, so its projection stays star-shaped about the projected origin:
+    the farthest projected point per angular bin is the visible outline.
+    Bins left empty by sparse sampling are filled by circular interpolation
+    between their nearest filled neighbours, so the contour closes smoothly.
+    """
+    ox, oy = origin
+    radii = [0.0] * bins
+    seen = [False] * bins
+    for x, y in points_xy:
+        radius = math.hypot(x - ox, y - oy)
+        if radius <= 1e-9:
+            continue
+        index = int((math.atan2(y - oy, x - ox) % (2.0 * math.pi)) / (2.0 * math.pi) * bins) % bins
+        if radius > radii[index]:
+            radii[index] = radius
+            seen[index] = True
+    if not any(seen):
+        return []
+    filled = [index for index, mark in enumerate(seen) if mark]
+    if len(filled) == 1:
+        return [(2.0 * math.pi * index / bins, radii[filled[0]]) for index in range(bins)]
+    for index in range(bins):
+        if seen[index]:
+            continue
+        following = next((f for f in filled if f > index), filled[0] + bins)
+        preceding = max((f for f in filled if f < index), default=filled[-1] - bins)
+        weight = (index - preceding) / (following - preceding)
+        radii[index] = radii[preceding % bins] * (1.0 - weight) + radii[following % bins] * weight
+    return [(2.0 * math.pi * index / bins, radii[index]) for index in range(bins)]
+
+
+def _contour_path(
+    outline: Sequence[tuple[float, float]],
+    origin: tuple[float, float],
+    scale: float = 1.0,
+    wobble: float = 0.0,
+    phase: float = 0.0,
+) -> str:
+    """A closed, smooth SVG path following ``outline`` (scaled, optionally wobbled).
+
+    Samples are joined with cubic beziers (a closed Catmull-Rom spline), which
+    turns the sampled radial function into a smooth iso-contour. ``wobble``
+    adds a mild deterministic angular perturbation -- two low harmonics -- so
+    the drawn rings read as an irregular curved manifold rather than concentric
+    circles. Deterministic by construction, so the map is reproducible.
+    """
+    count = len(outline)
+    if count < 3:
+        return ""
+    ox, oy = origin
+    samples: list[tuple[float, float]] = []
+    for angle, radius in outline:
+        reach = radius * scale * (
+            1.0 + wobble * (0.6 * math.sin(3.0 * angle + phase) + 0.4 * math.sin(5.0 * angle + 1.7 * phase))
+        )
+        samples.append((ox + reach * math.cos(angle), oy + reach * math.sin(angle)))
+    parts = [f"M {samples[0][0]:.1f} {samples[0][1]:.1f}"]
+    for index in range(count):
+        p0, p1 = samples[index - 1], samples[index]
+        p2, p3 = samples[(index + 1) % count], samples[(index + 2) % count]
+        c1x, c1y = p1[0] + (p2[0] - p0[0]) / 6.0, p1[1] + (p2[1] - p0[1]) / 6.0
+        c2x, c2y = p2[0] - (p3[0] - p1[0]) / 6.0, p2[1] - (p3[1] - p1[1]) / 6.0
+        parts.append(f"C {c1x:.1f} {c1y:.1f} {c2x:.1f} {c2y:.1f} {p2[0]:.1f} {p2[1]:.1f}")
+    parts.append("Z")
+    return " ".join(parts)
 
 
 def render_ascii_map(
@@ -797,8 +878,8 @@ def render_ascii_map(
     """Draw the selection ball in the text report, zoomed on the chosen items.
 
     Coordinates are ``(age, authority, corroboration)`` deficits projected
-    isometrically. 'O' is the ideal origin, '.' the selection surface, and each
-    selected item carries the number it has in its topic section. The frame is
+    isometrically. '.' traces the selection surface, and each selected item
+    carries the number it has in its topic section. The frame is
     fitted to the selection, because rejected leads sit far enough out that
     including them would compress the interesting structure into a few cells.
     """
@@ -838,7 +919,7 @@ def render_ascii_map(
         start = cell(point)
         if start is None:
             return None
-        if grid[start[0]][start[1]] not in "0123456789abcdefghijklmnopqrstuvwxyz+O":
+        if grid[start[0]][start[1]] not in "0123456789abcdefghijklmnopqrstuvwxyz+":
             return start
         for radius_step in range(1, 6):
             for delta_row in range(-radius_step, radius_step + 1):
@@ -847,7 +928,7 @@ def render_ascii_map(
                         continue
                     row, column = start[0] + delta_row, start[1] + delta_column
                     if 0 <= row < height and 0 <= column < width:
-                        if grid[row][column] not in "0123456789abcdefghijklmnopqrstuvwxyz+O":
+                        if grid[row][column] not in "0123456789abcdefghijklmnopqrstuvwxyz+":
                             return row, column
         return None
 
@@ -858,16 +939,12 @@ def render_ascii_map(
             continue
         grid[position[0]][position[1]] = legend[index] if index < len(legend) else "+"
 
-    origin = cell((0.0, 0.0, 0.0))
-    if origin:
-        grid[origin[0]][origin[1]] = "O"
-
     lines = ["+" + "-" * width + "+"]
     lines += ["|" + "".join(row) + "|" for row in grid]
     lines.append("+" + "-" * width + "+")
-    lines.append(f"O = ideal origin (0,0,0) | '.' marks the selection surface |d|_W = {star:.3f}")
+    lines.append(f"'.' marks the selection surface |d|_W = {star:.3f}")
     lines.append("markers 0-9a-z are the selected items in ranking order (0 is closest to the ideal)")
-    lines.append("rays from O grow the deficit: age up-right, authority up-left, corroboration down")
+    lines.append("axis rays grow the deficit: age up-right, authority up-left, corroboration down")
     return "\n".join(lines)
 
 
@@ -933,7 +1010,14 @@ def _render_map_svg(
     width: int = 560,
     height: int = 560,
 ) -> str:
-    """Inline SVG of the same cube the text map draws, with in-frame context leads."""
+    """Inline SVG of the same cube the text map draws, with in-frame context leads.
+
+    The map is drawn as a smooth high-dimensional manifold projection rather
+    than graph paper: a very soft radial backdrop suggests the potential
+    surface dipping toward the origin, nested iso-contours ring it, and the
+    selection surface itself is one closed contour. Data points, axis rays,
+    labels and markers keep their positions and colors.
+    """
     frame, surface, visible = _map_frame_and_context(stories, rejected, star, metric)
     low_x, low_y, span_x, span_y = frame
     pad = 26.0
@@ -947,30 +1031,50 @@ def _render_map_svg(
         sy = offset_y + (1.0 - (y - low_y) / span_y) * span_y * scale
         return sx, sy
 
-    parts: list[str] = ['<g class="cloud">']
+    origin = to_screen((0.0, 0.0, 0.0))
+    parts: list[str] = []
+
+    # Soft radial gradient backdrop: a faint pool of light at the origin that
+    # fades over the whole frame, suggesting the potential surface.
+    reach = max(math.hypot(cx - origin[0], cy - origin[1]) for cx, cy in
+                ((0.0, 0.0), (width, 0.0), (0.0, height), (width, height)))
+    parts.append(
+        f'<defs><radialGradient id="manifoldFade" gradientUnits="userSpaceOnUse" '
+        f'cx="{origin[0]:.1f}" cy="{origin[1]:.1f}" r="{reach:.1f}">'
+        '<stop offset="0" stop-color="#c9d6ea" stop-opacity=".45"/>'
+        '<stop offset="1" stop-color="#c9d6ea" stop-opacity="0"/></radialGradient></defs>'
+    )
+    parts.append(f'<rect x="0" y="0" width="{width}" height="{height}" fill="url(#manifoldFade)"/>')
+
+    # The manifold: the selection surface as one smooth closed contour, plus
+    # nested, mildly perturbed iso-contours ringing the origin. Strokes thin
+    # out and fade toward the rim, like level sets of a curved surface.
+    outline = _angular_outline([to_screen(point) for point in surface], origin)
+    if outline:
+        parts.append(f'<path class="surface" d="{_contour_path(outline, origin)}"/>')
+        for index, fraction in enumerate(MANIFOLD_RINGS):
+            depth = index / max(1, len(MANIFOLD_RINGS) - 1)
+            parts.append(
+                f'<path class="manifold" stroke-opacity="{0.42 * (1.0 - 0.68 * depth):.2f}" '
+                f'stroke-width="{1.1 - 0.55 * depth:.2f}" '
+                f'd="{_contour_path(outline, origin, scale=fraction, wobble=0.05, phase=1.3 + 2.4 * index)}"/>'
+            )
+
+    parts.append('<g class="cloud">')
     for story in visible[:400]:
         sx, sy = to_screen(story.trust)
         parts.append(f'<circle cx="{sx:.1f}" cy="{sy:.1f}" r="1.6"/>')
     parts.append("</g>")
 
     parts.append('<g class="axes">')
-    ox, oy = to_screen((0.0, 0.0, 0.0))
     for label, direction in AXIS_RAYS:
         end = _ray_to_frame(_iso(direction), frame)
-        ex, ey = to_screen((0.0, 0.0, 0.0))
-        ex += end[0] * scale
-        ey -= end[1] * scale
-        parts.append(f'<line x1="{ox:.1f}" y1="{oy:.1f}" x2="{ex:.1f}" y2="{ey:.1f}"/>')
+        ex, ey = origin[0] + end[0] * scale, origin[1] - end[1] * scale
+        parts.append(f'<line x1="{origin[0]:.1f}" y1="{origin[1]:.1f}" x2="{ex:.1f}" y2="{ey:.1f}"/>')
         parts.append(
-            f'<text class="axlabel" x="{ox + end[0] * scale * 0.94:.1f}" '
-            f'y="{oy - end[1] * scale * 0.94:.1f}">{_esc(label)}</text>'
+            f'<text class="axlabel" x="{origin[0] + end[0] * scale * 0.94:.1f}" '
+            f'y="{origin[1] - end[1] * scale * 0.94:.1f}">{_esc(label)}</text>'
         )
-    parts.append("</g>")
-
-    parts.append('<g class="surface">')
-    for candidate in surface:
-        sx, sy = to_screen(candidate)
-        parts.append(f'<circle cx="{sx:.1f}" cy="{sy:.1f}" r="1.9"/>')
     parts.append("</g>")
 
     for index, story in enumerate(stories):
@@ -990,8 +1094,6 @@ def _render_map_svg(
             f'<text class="marker" x="{sx + size + 1.5:.1f}" y="{sy + 3.5:.1f}">{_esc(marker)}</text>'
         )
 
-    parts.append(f'<circle class="ideal" cx="{ox:.1f}" cy="{oy:.1f}" r="4.5"/>')
-    parts.append(f'<text class="idealtext" x="{ox + 7:.1f}" y="{oy - 6:.1f}">ideal (0,0,0)</text>')
     return (
         f'<svg class="map" viewBox="0 0 {width} {height}" role="img" '
         f'aria-label="Trust cube map of the selected stories with rejected leads in grey">'
@@ -1018,8 +1120,9 @@ def _render_map_section(
     )
     return (
         '<p class="story-meta">Every item is plotted at its (age, authority, corroboration) deficits, projected '
-        f'isometrically. The dotted ellipsoid is the selection surface |d|_W = {star:.3f} and the red ring is the ideal '
-        '(0,0,0), so closer is stronger. Grey dots are rejected leads, and each marker is the topic-section label of a '
+        f'isometrically. The smooth closed contour is the selection surface |d|_W = {star:.3f} and the nested rings '
+        'trace the manifold\'s falloff around the strongest evidence, so closer is stronger. Grey dots are rejected '
+        'leads, and each marker is the topic-section label of a '
         f"chosen item (T = technology, G = geopolitics, E = economics).{note}</p>"
         + _render_map_svg(stories, star, rejected, labels, metric)
     )
@@ -1222,17 +1325,17 @@ th,td{{border:1px solid #dfe5ee;padding:6px 8px;text-align:left;vertical-align:t
 th{{background:#f6f8fb}}details.stats summary{{cursor:pointer;color:#174ea6;font-size:13px}}
 svg.map{{width:100%;height:auto;border:1px solid #dfe5ee;background:#fbfcfe;border-radius:6px}}
 svg.map .axes line{{stroke:#b6c2d4;stroke-width:1;stroke-dasharray:4 4}}
-svg.map .surface circle{{fill:#7c8ba1;fill-opacity:.18}}
+svg.map .surface path{{fill:#7c8ba1;fill-opacity:.10;stroke:#7c8ba1;stroke-width:1.2;stroke-opacity:.7}}
+svg.map .manifold path{{fill:none;stroke:#8fa2bc}}
 svg.map .cloud circle{{fill:#b9c2d0;fill-opacity:.45}}
 svg.map .axlabel{{font-size:10px;fill:#667085}}svg.map .marker{{font-size:10px;fill:#334155}}
-svg.map .ideal{{fill:none;stroke:#b91c1c;stroke-width:1.6}}svg.map .idealtext{{font-size:11px;fill:#b91c1c}}
 .ladder{{font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre;overflow-x:auto}}
 footer{{margin-top:38px;color:#667085;font-size:12px}}
 </style></head><body>
 <h1>Cosmos</h1>
 <p class="subtitle">Generated {generated.strftime("%Y-%m-%d %H:%M UTC")} · ranked leads, preserved evidence, no invented reporting</p>
 <div class="method"><strong>Selection surface:</strong> {selection.candidates} of {len(stories)} collected items sit inside the ball
-<span class="coords">|d|_W &lt;= {selection.radius:.3f}</span> around the ideal origin (fresh, authoritative, independently
+<span class="coords">|d|_W &lt;= {selection.radius:.3f}</span> around the origin (fresh, authoritative, independently
 confirmed, on topic, with a usable summary); {excluded} fell outside it. The brief shows {chosen} of them.{capacity_note}
 Filling rule: {_describe_selection(selection)}.
 Metric: <span class="coords">{_esc(metric.describe())}</span>. An item gets in on where it sits in the cube,
@@ -1272,7 +1375,7 @@ def render_text(
         "",
         "SELECTION SURFACE",
         "-----------------",
-        f"Ball around the ideal origin: |d|_W <= {selection.radius:.3f}",
+        f"Ball around the origin: |d|_W <= {selection.radius:.3f}",
         f"{selection.candidates} of {len(stories)} collected items qualified; "
         f"{max(0, len(stories) - selection.candidates)} fell outside the surface.",
         f"Brief shows {chosen} of the {selection.candidates} candidates.",

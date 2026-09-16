@@ -5,4 +5,15 @@
     <string name="loading_subtitle">Generating your news brief…</string>
     <string name="error_title">Couldn\'t generate your news brief</string>
     <string name="error_no_report">The pipeline finished, but no HTML report was found in the output directory:</string>
+
+    <!-- History bar and saved-issues dialog -->
+    <string name="history_button">History</string>
+    <string name="history_title">Past issues</string>
+    <string name="history_empty">No saved issues yet.\nGenerated briefs will appear here.</string>
+    <string name="history_today">Today</string>
+    <string name="history_overflow">%1$d older issues not shown</string>
+
+    <!-- Article overlay -->
+    <string name="article_close">✕</string>
+    <string name="article_close_description">Close article</string>
 </resources>
