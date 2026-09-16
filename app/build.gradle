@@ -32,7 +32,22 @@ android {
         }
     }
 
+    signingConfigs {
+        debug {
+            storeFile rootProject.file("debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
+
     buildTypes {
+        debug {
+            // Stable debug keystore (committed, standard debug credentials) so
+            // every CI build signs identically and APK updates install over
+            // the previous version instead of demanding an uninstall.
+            signingConfig signingConfigs.debug
+        }
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
