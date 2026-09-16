@@ -13,7 +13,13 @@ catalog on your own network before trusting it, and keep expensive or flaky
 feeds out of the default set. Every retirements found in the first version are
 recorded in this file's history: Reuters killed ``feeds.reuters.com``, the IMF
 news RSS URL 404s, the World Bank ``?format=rss`` endpoint now serves HTML, and
-Carnegie's ``solr`` feed now returns a web page rather than items.
+Carnegie's ``solr`` feed now returns a web page rather than items. Removed in
+September 2026: CISA Advisories (at the user's request) and NYT World, Financial
+Times, and The Economist (hard paywalls); the free replacements added in their
+place (CNBC, MarketWatch, Yahoo Finance, US Treasury News, an AP News discovery
+lane, War on the Rocks, The Register, IEEE Spectrum, Hacker News) were each
+probed live first. Tech Policy Press was probed for the same Technology slot but
+its site no longer serves RSS at any feed path, so it stayed out.
 """
 from __future__ import annotations
 
@@ -85,7 +91,9 @@ DEFAULT_SOURCES: tuple[Source, ...] = (
     Source("WTO News", "https://www.wto.org/library/rss/latest_news_e.xml", "Economics", 1),
     Source("BLS Latest Numbers", "https://www.bls.gov/feed/bls_latest.rss", "Economics", 1),
     Source("EIA Today in Energy", "https://www.eia.gov/rss/todayinenergy.xml", "Economics", 1),
-    Source("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml", "Technology", 1),
+    # Treasury's dedicated press-release feed path is gone; /rss.xml is the
+    # endpoint that still answers, and it mixes press releases with site pages.
+    Source("US Treasury News", "https://home.treasury.gov/rss.xml", "Economics", 1),
     Source("NIST News", "https://www.nist.gov/news-events/news/rss.xml", "Technology", 1),
     Source("OpenAI News", "https://openai.com/news/rss.xml", "Technology", 1),
     Source("Google AI Blog", "https://blog.google/technology/ai/rss/", "Technology", 1),
@@ -100,12 +108,14 @@ DEFAULT_SOURCES: tuple[Source, ...] = (
     Source("BBC Technology", "https://feeds.bbci.co.uk/news/technology/rss.xml", "Technology", 2),
     Source("MIT Technology Review", "https://www.technologyreview.com/feed/", "Technology", 2),
     Source("Ars Technica", "https://arstechnica.com/feed/", "Technology", 2),
+    Source("The Register", "https://www.theregister.com/feed/", "Technology", 2),
+    Source("IEEE Spectrum", "https://spectrum.ieee.org/feeds/feed.rss", "Technology", 2),
     Source("arXiv cs.AI", "https://export.arxiv.org/rss/cs.AI", "Technology", 2, note="preprints: not peer reviewed"),
     Source("arXiv cs.CR", "https://export.arxiv.org/rss/cs.CR", "Technology", 2, note="preprints: not peer reviewed"),
     Source("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml", "Geopolitics", 2),
     Source("NPR World", "https://feeds.npr.org/1004/rss.xml", "Geopolitics", 2),
-    Source("NYT World", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "Geopolitics", 2),
     Source("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml", "Geopolitics", 2),
+    Source("War on the Rocks", "https://warontherocks.com/feed/", "Geopolitics", 2),
     # The bare ``/feed/`` path now serves the HTML homepage; the article post-type
     # query is the endpoint that still returns RSS.
     Source("Brookings", "https://www.brookings.edu/feed/?post_type=article", "Geopolitics", 2),
@@ -115,15 +125,19 @@ DEFAULT_SOURCES: tuple[Source, ...] = (
     Source("Stimson Center", "https://www.stimson.org/feed/", "Geopolitics", 2),
     Source("BBC Business", "https://feeds.bbci.co.uk/news/business/rss.xml", "Economics", 2),
     Source("NPR Business", "https://feeds.npr.org/1006/rss.xml", "Economics", 2),
-    Source("Financial Times", "https://www.ft.com/rss/home", "Economics", 2),
-    Source("The Economist: Finance", "https://www.economist.com/finance-and-economics/rss.xml", "Economics", 2),
+    Source("CNBC Business", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114", "Economics", 2),
+    # MarketWatch's own feeds host 301s here; the dowjones endpoint is the target.
+    Source("MarketWatch Top Stories", "https://feeds.content.dowjones.io/public/rss/mw_topstories", "Economics", 2),
+    Source("Yahoo Finance", "https://finance.yahoo.com/news/rssindex", "Economics", 2),
     Source("PIIE", "https://www.piie.com/rss/update.xml", "Economics", 2),
     Source("arXiv q-fin", "https://export.arxiv.org/rss/q-fin", "Economics", 2, note="preprints: not peer reviewed"),
     # --- Tier 3: specialist and discovery ---------------------------------- #
     Source("The Verge", "https://www.theverge.com/rss/index.xml", "Technology", 3),
     Source("TechCrunch", "https://techcrunch.com/feed/", "Technology", 3),
     Source("Wired", "https://www.wired.com/feed/rss", "Technology", 3),
+    Source("Hacker News Front Page", "https://hnrss.org/frontpage", "Technology", 3, note="community aggregator"),
     google_news_source("site:reuters.com", "Reuters discovery lane", "Geopolitics"),
+    google_news_source("site:apnews.com", "AP News discovery lane", "Geopolitics"),
     google_news_source("site:reuters.com (markets OR economy OR inflation)", "Reuters markets discovery lane", "Economics"),
 )
 

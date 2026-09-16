@@ -65,6 +65,63 @@ def _clip(value: str, limit: int = SUMMARY_CHARS) -> str:
     return head.rstrip(" ,;:.") + " …"
 
 
+def _fresh_age(seconds: float) -> str:
+    """Wording for an age under a day: 'just now', '5 minutes ago', '2 hours ago'.
+
+    Shared by story timestamps and the report's Generated line so the two never
+    drift apart; callers keep it below 86400 seconds.
+    """
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        minutes = int(seconds // 60)
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    hours = int(seconds // 3600)
+    return f"{hours} hour{'s' if hours != 1 else ''} ago"
+
+
+def _relative_label(published: datetime, now: datetime | None = None) -> str:
+    """Render ``published`` in the reader's local time with a relative prefix.
+
+    The report is read on the user's own device, so local time is always the
+    meaningful one. Age buckets: under a day gets a relative prefix ('2 hours
+    ago'), under two days reads 'yesterday, HH:MM', under a week 'N days ago,
+    HH:MM', and older items show the absolute local time alone; the year is
+    appended only when the item is not from the current one. The optional
+    ``now`` keeps the buckets testable without mocking the clock.
+    """
+    now = now or datetime.now(timezone.utc)
+    seconds = (now - published).total_seconds()
+    local = published.astimezone()
+    if local.year == now.astimezone().year:
+        absolute, day = local.strftime("%b %d, %H:%M"), local.strftime("%b %d")
+    else:
+        absolute, day = local.strftime("%b %d, %Y, %H:%M"), local.strftime("%b %d, %Y")
+    if seconds < 86400:
+        return f"{_fresh_age(seconds)} · {absolute}"
+    if seconds < 172800:
+        return f"yesterday, {local:%H:%M} · {day}"
+    if seconds < 604800:
+        return f"{int(seconds // 86400)} days ago, {local:%H:%M} · {day}"
+    return absolute
+
+
+def _generation_stamp(generated: datetime) -> str:
+    """Reader-local header stamp for the report itself: 'Sep 16, 14:32'.
+
+    The relative suffix ('· 2 hours ago') is worth showing only while the brief
+    is fresh; after a day the age is the least interesting fact about it.
+    """
+    now = datetime.now(timezone.utc)
+    local = generated.astimezone()
+    pattern = "%b %d, %H:%M" if local.year == now.astimezone().year else "%b %d, %Y, %H:%M"
+    stamp = local.strftime(pattern)
+    age = (now - generated).total_seconds()
+    if 0 <= age < 86400:
+        stamp += f" · {_fresh_age(age)}"
+    return stamp
+
+
 @dataclass
 class Story:
     title: str
@@ -110,7 +167,7 @@ class Story:
     def date_label(self) -> str:
         if not self.published:
             return "Date unavailable"
-        return self.published.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        return _relative_label(self.published)
 
     @property
     def evidence_label(self) -> str:
@@ -993,7 +1050,7 @@ def _map_frame_2d(
 #: SVG. Scoped to ``svg.map`` elements and idempotent, so it only ever touches
 #: the salience map and never the surrounding report page.
 _PAN_ZOOM_SCRIPT = """<script>
-/* cosmos salience map pan/zoom — scoped to svg.map elements */
+/* cosmos salience map pan/zoom - collapse-proof, scoped to svg.map elements */
 (function () {
   var maps = document.querySelectorAll("svg.map");
   for (var i = 0; i < maps.length; i++) (function (svg) {
@@ -1004,31 +1061,41 @@ _PAN_ZOOM_SCRIPT = """<script>
     var vb = svg.viewBox && svg.viewBox.baseVal
       ? [svg.viewBox.baseVal.x, svg.viewBox.baseVal.y, svg.viewBox.baseVal.width, svg.viewBox.baseVal.height]
       : [0, 0, 560, 560];
-    var baseW = vb[2], baseH = vb[3];
-    var view = { x: vb[0], y: vb[1], w: vb[2], h: vb[3] };
-    var MIN = 0.5, MAX = 6, PAN = 2.5;
+    var baseX = vb[0], baseY = vb[1], baseW = vb[2], baseH = vb[3];
+    var view = { x: baseX, y: baseY, w: baseW, h: baseH };
+    var MIN = 0.5, MAX = 6, PAN = 2.5, EPS = 8;
 
-    function apply() { svg.setAttribute("viewBox", view.x + " " + view.y + " " + view.w + " " + view.h); }
-    function clamp() {
+    /* The ONLY place the viewBox attribute is written. Sanitizes first: any
+       NaN / Infinity / non-positive value resets to base, the height is always
+       rebuilt from the base aspect ratio, and the zoom is clamped to
+       [MIN, MAX]. A collapse therefore cannot persist. */
+    function apply() {
+      if (!isFinite(view.x)) view.x = baseX;
+      if (!isFinite(view.y)) view.y = baseY;
+      if (!isFinite(view.w) || view.w <= 0) view.w = baseW;
+      view.h = baseH / baseW * view.w;
+      if (!isFinite(view.h) || view.h <= 0) view.h = baseH;
       var s = baseW / view.w;
       if (s < MIN) { view.w = baseW / MIN; view.h = baseH / MIN; }
       else if (s > MAX) { view.w = baseW / MAX; view.h = baseH / MAX; }
       var mw = PAN * view.w, mh = PAN * view.h;
       view.x = Math.max(-mw, Math.min(mw, view.x));
       view.y = Math.max(-mh, Math.min(mh, view.y));
+      svg.setAttribute("viewBox", view.x + " " + view.y + " " + view.w + " " + view.h);
     }
     function at(cx, cy) {
       var r = svg.getBoundingClientRect();
-      return { x: view.x + (cx - r.left) / r.width * view.w, y: view.y + (cy - r.top) / r.height * view.h };
+      return { x: view.x + (cx - r.left) / r.width * view.w,
+               y: view.y + (cy - r.top) / r.height * view.h };
     }
     function zoom(f, cx, cy) {
+      if (!isFinite(f) || f <= 0) return;
       var p = at(cx, cy);
       var nw = view.w / f;
-      var s = nw / view.w;
-      view.x = p.x - (p.x - view.x) * s;
-      view.y = p.y - (p.y - view.y) * s;
-      view.w = nw; view.h = baseH / baseW * nw;
-      clamp(); apply();
+      view.x = p.x - (p.x - view.x) * (nw / view.w);
+      view.y = p.y - (p.y - view.y) * (nw / view.w);
+      view.w = nw;
+      apply();
     }
     function dist(a, b) {
       var dx = a.clientX - b.clientX, dy = a.clientY - b.clientY;
@@ -1037,27 +1104,40 @@ _PAN_ZOOM_SCRIPT = """<script>
 
     var pointers = {}, drag = null, pinch = null, lastTap = 0;
 
+    function pointerCount() { return Object.keys(pointers).length; }
+
     function down(e) {
-      pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
-      var ids = Object.keys(pointers);
-      if (ids.length === 1) {
+      pointers[e.pointerId] = { clientX: e.clientX, clientY: e.clientY };
+      if (pointerCount() === 1) {
         drag = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: 0 };
-        if (svg.setPointerCapture) svg.setPointerCapture(e.pointerId);
+        if (svg.setPointerCapture) {
+          try { svg.setPointerCapture(e.pointerId); } catch (err) {}
+        }
         svg.style.cursor = "grabbing";
-      } else if (ids.length === 2) {
-        pinch = { d: dist(pointers[ids[0]], pointers[ids[1]]) };
-        drag = null;
+      } else if (pointerCount() === 2) {
+        var ids = Object.keys(pointers);
+        var d = dist(pointers[ids[0]], pointers[ids[1]]);
+        /* Finger-on-finger contact: do NOT enter pinch mode until the two
+           pointers separate beyond EPS. This is what collapsed the map. */
+        if (d >= EPS) {
+          pinch = { d: d };
+          drag = null;
+        }
       }
     }
     function move(e) {
       if (!pointers[e.pointerId]) return;
-      pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
-      var ids = Object.keys(pointers);
-      if (ids.length === 2 && pinch) {
-        var d = dist(pointers[ids[0]], pointers[ids[1]]);
-        var cx = (pointers[ids[0]].x + pointers[ids[1]].x) / 2;
-        var cy = (pointers[ids[0]].y + pointers[ids[1]].y) / 2;
-        zoom(d / pinch.d, cx, cy);
+      pointers[e.pointerId] = { clientX: e.clientX, clientY: e.clientY };
+      if (pinch && pointerCount() >= 2) {
+        var ids = Object.keys(pointers);
+        var a = pointers[ids[0]], b = pointers[ids[1]];
+        var d = dist(a, b);
+        /* Zoom only on a healthy, changed distance: near-zero or unchanged
+           distances are skipped entirely, so no runaway factor is possible. */
+        if (d >= EPS && pinch.d >= EPS && Math.abs(d - pinch.d) > 0.01) {
+          var m = { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 };
+          zoom(d / pinch.d, m.x, m.y);
+        }
         pinch.d = d;
       } else if (drag && drag.id === e.pointerId) {
         var r = svg.getBoundingClientRect();
@@ -1066,10 +1146,10 @@ _PAN_ZOOM_SCRIPT = """<script>
         drag.moved += Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y);
         drag.x = e.clientX; drag.y = e.clientY;
         view.x -= dx; view.y -= dy;
-        clamp(); apply();
+        apply();
       }
     }
-    function up(e) {
+    function release(e) {
       var wasDrag = drag && drag.id === e.pointerId;
       var wasTap = wasDrag && drag.moved < 6;
       delete pointers[e.pointerId];
@@ -1082,13 +1162,17 @@ _PAN_ZOOM_SCRIPT = """<script>
           else lastTap = now;
         }
       }
-      if (Object.keys(pointers).length < 2) pinch = null;
+      /* Fewer than two pointers means pinch is over, even if the other
+         finger's pointerup was missed entirely. */
+      if (pointerCount() < 2) pinch = null;
+      if (pointerCount() === 0) drag = null;
     }
 
     svg.addEventListener("pointerdown", down);
     svg.addEventListener("pointermove", move);
-    svg.addEventListener("pointerup", up);
-    svg.addEventListener("pointercancel", up);
+    svg.addEventListener("pointerup", release);
+    svg.addEventListener("pointercancel", release);
+    svg.addEventListener("pointerleave", release);
     svg.addEventListener("wheel", function (e) {
       e.preventDefault();
       zoom(e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX, e.clientY);
@@ -1451,7 +1535,7 @@ def render_html(
         if selection.at_capacity
         else ""
     )
-    return f'''<!doctype html><html><head><meta charset="utf-8"><title>Cosmos · {generated.date()}</title><style>
+    return f'''<!doctype html><html><head><meta charset="utf-8"><title>Cosmos · {generated.astimezone().date()}</title><style>
 body{{font-family:Arial,sans-serif;max-width:900px;margin:40px auto;color:#172033;line-height:1.5;padding:0 16px}}
 h1{{font-size:30px;margin-bottom:4px}}h2{{border-bottom:2px solid #2563eb;padding-bottom:5px;margin-top:34px}}
 h3{{margin:5px 0;font-size:18px}}a{{color:#174ea6}}.subtitle,.story-meta,.evidence,.coords{{color:#667085;font-size:12px}}
@@ -1469,7 +1553,7 @@ footer{{margin-top:38px;color:#667085;font-size:12px}}
 .back-issues{{margin-top:12px;font-size:12px;color:#667085}}.back-issues a{{color:#667085}}
 </style></head><body>
 <h1>Cosmos</h1>
-<p class="subtitle">Generated {generated.strftime("%Y-%m-%d %H:%M UTC")} · ranked leads, preserved evidence, no invented reporting</p>
+<p class="subtitle">Generated {_generation_stamp(generated)} · ranked leads, preserved evidence, no invented reporting</p>
 <div class="method"><strong>Selection surface:</strong> {selection.candidates} of {len(stories)} collected items sit inside the ball
 <span class="coords">|d|_W &lt;= {selection.radius:.3f}</span> around the origin (fresh, authoritative, independently
 confirmed, on topic, with a usable summary); {excluded} fell outside it. The brief shows {chosen} of them.{capacity_note}
@@ -1506,7 +1590,7 @@ def render_text(
     chosen = len(selection.stories)
     lines = [
         "COSMOS",
-        f"Generated: {generated.strftime('%Y-%m-%d %H:%M UTC')}",
+        f"Generated: {_generation_stamp(generated)}",
         "",
         "Headlines are source-linked leads; corroboration and confidence are explicit.",
         "",
@@ -1618,7 +1702,9 @@ def write_report(
     selection = selection or select_on_manifold(stories, quota=per_category * 3, metric=metric)
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    stem = generated.strftime("%Y-%m-%d")
+    # The file date is the reader's "today", not UTC's: the Android same-day
+    # cache compares against the device clock, and so does anyone reading the name.
+    stem = generated.astimezone().strftime("%Y-%m-%d")
     html_path, text_path = directory / f"{stem}.html", directory / f"{stem}.txt"
     html_path.write_text(
         render_html(stories, errors, generated, per_category, selection, stats, metric, per_source),

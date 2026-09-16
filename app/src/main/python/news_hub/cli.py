@@ -271,7 +271,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"HTML: {html_path}\nText: {text_path}")
     if not args.no_pdf:
-        pdf_path = Path(args.output) / f"{generated.strftime('%Y-%m-%d')}.pdf"
+        # Same stem as the HTML/TXT pair (the local date), so the three files
+        # always read as one issue no matter what the UTC clock says.
+        pdf_path = html_path.with_suffix(".pdf")
         write_simple_pdf(
             render_text(
                 stories,
