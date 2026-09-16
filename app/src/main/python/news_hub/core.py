@@ -838,12 +838,12 @@ def _map_frame(
     return (center_x - span / 2.0, center_y - span / 2.0, span, span)
 
 
-#: Padding around the drawn data inside the SVG salience map, in px. The two
-#: flat axes, arrowheads and labels live inside this margin, and the
-#: label-extent guard keeps every text box inside it.
+#: Padding around the drawn data inside the SVG salience map, in px. Every
+#: dot, vector and label lives inside this margin, and the label-extent
+#: guard keeps every text box inside it.
 MAP_PADDING = 30.0
 
-#: Font size of the map's axis and marker labels, in px.
+#: Font size of the map's marker labels, in px.
 MAP_LABEL_FONT_SIZE = 11.0
 
 #: Estimated rendered width of one character at :data:`MAP_LABEL_FONT_SIZE`, in px.
@@ -1046,142 +1046,6 @@ def _map_frame_2d(
     return (min_x - pad_x, min_y - pad_y, span_x + 2.0 * pad_x, span_y + 2.0 * pad_y)
 
 
-#: Inline, dependency-free pan/zoom script emitted immediately after each map
-#: SVG. Scoped to ``svg.map`` elements and idempotent, so it only ever touches
-#: the salience map and never the surrounding report page.
-_PAN_ZOOM_SCRIPT = """<script>
-/* cosmos salience map pan/zoom - collapse-proof, scoped to svg.map elements */
-(function () {
-  var maps = document.querySelectorAll("svg.map");
-  for (var i = 0; i < maps.length; i++) (function (svg) {
-    if (svg.__cosmosPanZoom) return;
-    svg.__cosmosPanZoom = true;
-    svg.style.touchAction = "none";
-    svg.style.cursor = "grab";
-    var vb = svg.viewBox && svg.viewBox.baseVal
-      ? [svg.viewBox.baseVal.x, svg.viewBox.baseVal.y, svg.viewBox.baseVal.width, svg.viewBox.baseVal.height]
-      : [0, 0, 560, 560];
-    var baseX = vb[0], baseY = vb[1], baseW = vb[2], baseH = vb[3];
-    var view = { x: baseX, y: baseY, w: baseW, h: baseH };
-    var MIN = 0.5, MAX = 6, PAN = 2.5, EPS = 8;
-
-    /* The ONLY place the viewBox attribute is written. Sanitizes first: any
-       NaN / Infinity / non-positive value resets to base, the height is always
-       rebuilt from the base aspect ratio, and the zoom is clamped to
-       [MIN, MAX]. A collapse therefore cannot persist. */
-    function apply() {
-      if (!isFinite(view.x)) view.x = baseX;
-      if (!isFinite(view.y)) view.y = baseY;
-      if (!isFinite(view.w) || view.w <= 0) view.w = baseW;
-      view.h = baseH / baseW * view.w;
-      if (!isFinite(view.h) || view.h <= 0) view.h = baseH;
-      var s = baseW / view.w;
-      if (s < MIN) { view.w = baseW / MIN; view.h = baseH / MIN; }
-      else if (s > MAX) { view.w = baseW / MAX; view.h = baseH / MAX; }
-      var mw = PAN * view.w, mh = PAN * view.h;
-      view.x = Math.max(-mw, Math.min(mw, view.x));
-      view.y = Math.max(-mh, Math.min(mh, view.y));
-      svg.setAttribute("viewBox", view.x + " " + view.y + " " + view.w + " " + view.h);
-    }
-    function at(cx, cy) {
-      var r = svg.getBoundingClientRect();
-      return { x: view.x + (cx - r.left) / r.width * view.w,
-               y: view.y + (cy - r.top) / r.height * view.h };
-    }
-    function zoom(f, cx, cy) {
-      if (!isFinite(f) || f <= 0) return;
-      var p = at(cx, cy);
-      var nw = view.w / f;
-      view.x = p.x - (p.x - view.x) * (nw / view.w);
-      view.y = p.y - (p.y - view.y) * (nw / view.w);
-      view.w = nw;
-      apply();
-    }
-    function dist(a, b) {
-      var dx = a.clientX - b.clientX, dy = a.clientY - b.clientY;
-      return Math.sqrt(dx * dx + dy * dy);
-    }
-
-    var pointers = {}, drag = null, pinch = null, lastTap = 0;
-
-    function pointerCount() { return Object.keys(pointers).length; }
-
-    function down(e) {
-      pointers[e.pointerId] = { clientX: e.clientX, clientY: e.clientY };
-      if (pointerCount() === 1) {
-        drag = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: 0 };
-        if (svg.setPointerCapture) {
-          try { svg.setPointerCapture(e.pointerId); } catch (err) {}
-        }
-        svg.style.cursor = "grabbing";
-      } else if (pointerCount() === 2) {
-        var ids = Object.keys(pointers);
-        var d = dist(pointers[ids[0]], pointers[ids[1]]);
-        /* Finger-on-finger contact: do NOT enter pinch mode until the two
-           pointers separate beyond EPS. This is what collapsed the map. */
-        if (d >= EPS) {
-          pinch = { d: d };
-          drag = null;
-        }
-      }
-    }
-    function move(e) {
-      if (!pointers[e.pointerId]) return;
-      pointers[e.pointerId] = { clientX: e.clientX, clientY: e.clientY };
-      if (pinch && pointerCount() >= 2) {
-        var ids = Object.keys(pointers);
-        var a = pointers[ids[0]], b = pointers[ids[1]];
-        var d = dist(a, b);
-        /* Zoom only on a healthy, changed distance: near-zero or unchanged
-           distances are skipped entirely, so no runaway factor is possible. */
-        if (d >= EPS && pinch.d >= EPS && Math.abs(d - pinch.d) > 0.01) {
-          var m = { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 };
-          zoom(d / pinch.d, m.x, m.y);
-        }
-        pinch.d = d;
-      } else if (drag && drag.id === e.pointerId) {
-        var r = svg.getBoundingClientRect();
-        var dx = (e.clientX - drag.x) / r.width * view.w;
-        var dy = (e.clientY - drag.y) / r.height * view.h;
-        drag.moved += Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y);
-        drag.x = e.clientX; drag.y = e.clientY;
-        view.x -= dx; view.y -= dy;
-        apply();
-      }
-    }
-    function release(e) {
-      var wasDrag = drag && drag.id === e.pointerId;
-      var wasTap = wasDrag && drag.moved < 6;
-      delete pointers[e.pointerId];
-      if (wasDrag) {
-        svg.style.cursor = "grab";
-        drag = null;
-        if (wasTap) {
-          var now = Date.now();
-          if (now - lastTap < 300) { zoom(2, e.clientX, e.clientY); lastTap = 0; }
-          else lastTap = now;
-        }
-      }
-      /* Fewer than two pointers means pinch is over, even if the other
-         finger's pointerup was missed entirely. */
-      if (pointerCount() < 2) pinch = null;
-      if (pointerCount() === 0) drag = null;
-    }
-
-    svg.addEventListener("pointerdown", down);
-    svg.addEventListener("pointermove", move);
-    svg.addEventListener("pointerup", release);
-    svg.addEventListener("pointercancel", release);
-    svg.addEventListener("pointerleave", release);
-    svg.addEventListener("wheel", function (e) {
-      e.preventDefault();
-      zoom(e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX, e.clientY);
-    }, { passive: false });
-  })(maps[i]);
-})();
-</script>"""
-
-
 def _render_map_svg(
     stories: Sequence[Story],
     star: float,
@@ -1191,7 +1055,7 @@ def _render_map_svg(
     width: int = 560,
     height: int = 560,
 ) -> str:
-    """Inline SVG of the salience map as a clean 2-D age × authority plane.
+    """Inline SVG of the salience map as a bare 2-D dot field.
 
     Every collected item — the chosen stories and the rejected leads alike — is
     plotted at ``(age deficit, authority deficit)``; corroboration is left out
@@ -1200,9 +1064,8 @@ def _render_map_svg(
     frame. Each chosen story carries a thin vector from that origin to its dot,
     so a vector's length and direction are the item's deficit magnitude and
     direction. The frame is fitted to the whole data cloud with symmetric
-    padding; two flat axes sit along the bottom and left edges with arrowheads
-    at their positive ends, faint gridlines sit behind the data, and an inline
-    script (immediately after the SVG) makes the map draggable and zoomable.
+    padding. The map is a pure dot field on a transparent background: no axes,
+    ticks, gridlines, or script — the SVG element is the entire output.
     """
     pad = MAP_PADDING
     plot_w = width - 2.0 * pad
@@ -1232,55 +1095,7 @@ def _render_map_svg(
             f'font-size="11" fill="{color}">{_esc(text)}</text>'
         )
 
-    # Faint reference gridlines plus modest ticks on the two flat axes.
-    grid: list[str] = []
-    axes: list[str] = []
-    for fraction in (0.25, 0.5, 0.75):
-        gx = pad + fraction * plot_w
-        gy = pad + (1.0 - fraction) * plot_h
-        grid.append(f'<line x1="{gx:.1f}" y1="{pad:.1f}" x2="{gx:.1f}" y2="{height - pad:.1f}"/>')
-        grid.append(f'<line x1="{pad:.1f}" y1="{gy:.1f}" x2="{width - pad:.1f}" y2="{gy:.1f}"/>')
-        axes.append(
-            f'<line class="axis-tick" stroke-width="0.8" stroke-opacity="0.7" '
-            f'x1="{gx:.1f}" y1="{origin_y - 3.5:.1f}" x2="{gx:.1f}" y2="{origin_y + 3.5:.1f}"/>'
-        )
-        axes.append(
-            f'<line class="axis-tick" stroke-width="0.8" stroke-opacity="0.7" '
-            f'x1="{origin_x - 3.5:.1f}" y1="{gy:.1f}" x2="{origin_x + 3.5:.1f}" y2="{gy:.1f}"/>'
-        )
-
-    # The two flat axes along the bottom (age, arrow right) and left
-    # (authority, arrow up) edges, meeting at the origin corner.
-    axes.extend(
-        [
-            f'<line class="axis" x1="{pad:.1f}" y1="{origin_y:.1f}" x2="{width - pad:.1f}" y2="{origin_y:.1f}"/>',
-            f'<line class="axis" x1="{origin_x:.1f}" y1="{height - pad:.1f}" x2="{origin_x:.1f}" y2="{pad:.1f}"/>',
-        ]
-    )
-    axes.append(
-        f'<path class="axis-arrow" fill="#667085" stroke="none" '
-        f'd="M {width - pad:.1f} {origin_y:.1f} L {width - pad - 7:.1f} {origin_y - 3.5:.1f} '
-        f'L {width - pad - 7:.1f} {origin_y + 3.5:.1f} Z"/>'
-    )
-    axes.append(
-        f'<path class="axis-arrow" fill="#667085" stroke="none" '
-        f'd="M {origin_x:.1f} {pad:.1f} L {origin_x - 3.5:.1f} {pad + 7:.1f} '
-        f'L {origin_x + 3.5:.1f} {pad + 7:.1f} Z"/>'
-    )
-    # Subtle origin mark: a tiny slash at the corner, with no text.
-    axes.append(
-        f'<path class="origin-mark" stroke-width="1.2" '
-        f'd="M {origin_x - 3:.1f} {origin_y + 3:.1f} L {origin_x + 3:.1f} {origin_y - 3:.1f}"/>'
-    )
-    # Axis labels at the positive ends, clamped into the canvas.
-    axes.append(text_element(width - pad - 4.0, origin_y - 7.0, "age", "end", "axlabel", "#667085"))
-    axes.append(
-        text_element(origin_x + 6.0, pad + MAP_LABEL_FONT_SIZE + 4.0, "authority", "start", "axlabel", "#667085")
-    )
-
-    parts: list[str] = [
-        f'<g class="grid" stroke="#eef1f6" stroke-width="0.6" fill="none">{"".join(grid)}</g>'
-    ]
+    parts: list[str] = []
 
     # One thin, low-opacity vector per chosen story, from the origin to the
     # same nudged centre as the story's dot.
@@ -1300,17 +1115,12 @@ def _render_map_svg(
         f'fill="none">{"".join(vectors)}</g>'
     )
 
-    # Grey context dots: every rejected lead, painted behind the axes.
+    # Grey context dots: every rejected lead, painted behind the story dots.
     cloud_parts = [
         f'<circle cx="{sx:.1f}" cy="{sy:.1f}" r="1.6" fill="#b9c2d0" fill-opacity="0.45"/>'
         for sx, sy in (to_screen(story.trust) for story in rejected[:400])
     ]
     parts.append(f'<g class="cloud">{"".join(cloud_parts)}</g>')
-
-    parts.append(
-        '<g class="axes" stroke="#667085" stroke-width="1" stroke-opacity="0.85" fill="none">'
-        f'{"".join(axes)}</g>'
-    )
 
     for index, story in enumerate(stories):
         sx, sy = positions[index]
@@ -1328,7 +1138,7 @@ def _render_map_svg(
         f'<svg class="map" viewBox="0 0 {width} {height}" role="img" '
         f'aria-label="Salience map of age and authority deficits with rejected leads in grey">'
         f'{"".join(parts)}</svg>'
-    ) + _PAN_ZOOM_SCRIPT
+    )
 
 
 def _render_map_section(
@@ -1338,16 +1148,14 @@ def _render_map_section(
     labels: dict[int, str] | None = None,
     metric: geometry.Metric | None = None,
 ) -> str:
-    """The 2-D map plus a caption describing the age × authority plane."""
+    """The bare dot-field map plus a factual caption."""
     if not stories:
         return '<p>Nothing met the selection bar, so there is no map to draw.</p>'
     return (
-        '<p class="story-meta">Every collected item is plotted by its age and authority deficits on a '
-        'flat x-y plane (corroboration is excluded from this view). Each thin line runs from the origin '
-        '— fresh and authoritative, at the bottom-left corner — to a chosen item\'s dot, so a line\'s '
-        'length and direction are that story\'s deficit magnitude and direction: shorter is stronger. '
-        'Grey dots are rejected leads, and each marker is the topic-section label of a chosen item '
-        '(T = technology, G = geopolitics, E = economics). Drag to pan · pinch or double-tap to zoom.</p>'
+        '<p class="story-meta">Each dot is a collected story, and the grey dots are rejected leads. '
+        'Every thin line runs from the origin to a chosen story\'s dot, so a line\'s length and '
+        'direction are that story\'s deficit: shorter is stronger. Each marker is the topic-section '
+        'label of a chosen item (T = technology, G = geopolitics, E = economics).</p>'
         + _render_map_svg(stories, star, rejected, labels, metric)
     )
 

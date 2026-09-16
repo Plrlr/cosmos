@@ -1,26 +1,44 @@
 package com.cosmos.app
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.util.TypedValue
+import android.view.Gravity
 import android.view.View
+import android.view.WindowManager
 import android.webkit.WebChromeClient
 import android.webkit.WebHistoryItem
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import kotlin.math.roundToInt
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Single-activity app: show a loading screen, run the news_hub pipeline in
@@ -35,6 +53,11 @@ import java.util.Locale
  *
  * A same-day report already on disk is reused without re-running Python, so
  * reopening the app never re-fetches the day's feeds.
+ *
+ * The history page also offers a "Search" link: a full-screen, standalone
+ * chat with a GLM model that can search the web. It never touches the
+ * articles; its API key and model name live in SharedPreferences and are
+ * edited through the chat toolbar's "Key" button.
  *
  * Framework widgets only (no AndroidX): the theme, WebView and views all come
  * from android.*, so the build has zero runtime dependencies beyond Chaquopy
@@ -53,6 +76,21 @@ class MainActivity : Activity() {
     private lateinit var articleWebView: WebView
     private lateinit var articleUrlView: TextView
     private lateinit var articleProgress: ProgressBar
+
+    private lateinit var chatOverlay: View
+    private lateinit var chatScroll: ScrollView
+    private lateinit var chatList: LinearLayout
+    private lateinit var chatInput: EditText
+    private lateinit var chatSend: TextView
+
+    /** The session's conversation turns, in order: "user" and "assistant". */
+    private val chatHistory = ArrayList<ChatTurn>()
+
+    /** True while a chat request is in flight; guards the Send button. */
+    private var chatRequestInFlight = false
+
+    /** The transient "Thinking…" bubble, removed when the reply lands. */
+    private var chatThinkingView: TextView? = null
 
     /**
      * True from the moment a fresh article session starts until its first page
@@ -82,6 +120,19 @@ class MainActivity : Activity() {
         configureArticleWebView()
         findViewById<View>(R.id.articleClose).setOnClickListener { hideArticle() }
 
+        chatOverlay = findViewById(R.id.chatOverlay)
+        chatScroll = findViewById(R.id.chatScroll)
+        chatList = findViewById(R.id.chatList)
+        chatInput = findViewById(R.id.chatInput)
+        chatSend = findViewById(R.id.chatSend)
+        findViewById<View>(R.id.chatClose).setOnClickListener { closeChat() }
+        findViewById<View>(R.id.chatKey).setOnClickListener { showKeyDialog(showHint = false) }
+        chatSend.setOnClickListener { sendChatMessage() }
+
+        // Resize the window for the soft keyboard so the chat input row and
+        // the newest bubbles stay visible while typing.
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+
         // Starting Python and running the pipeline both block, so do it off
         // the UI thread; the completion path hops back via runOnUiThread().
         Thread(::runPipeline, "cosmos-pipeline").start()
@@ -103,9 +154,17 @@ class MainActivity : Activity() {
         // below, while file:// (the report itself and history.html) loads in
         // this view as usual. Returning false here is what keeps the report's
         // "Back issues" link in-view instead of bouncing it to the overlay.
+        // The history page's cosmos://search link opens the chat instead; any
+        // other cosmos:// link is swallowed so the WebView never errors on it.
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val scheme = request.url.scheme?.lowercase(Locale.US)
+                if (scheme == "cosmos") {
+                    if (request.url.host?.equals("search", ignoreCase = true) == true) {
+                        openChat()
+                    }
+                    return true
+                }
                 if (scheme == "http" || scheme == "https") {
                     showArticle(request.url.toString())
                     return true
@@ -201,12 +260,392 @@ class MainActivity : Activity() {
         }
     }
 
+    // ----------------------------------------------------------------------
+    // GLM chat ("Search") overlay
+    // ----------------------------------------------------------------------
+
+    /** Show the chat overlay, with a welcome bubble on a fresh session. */
+    private fun openChat() {
+        if (chatOverlay.visibility == View.VISIBLE) return
+        chatOverlay.visibility = View.VISIBLE
+        if (chatHistory.isEmpty() && chatList.childCount == 0) {
+            addAssistantBubble(getString(R.string.chat_welcome), sources = null)
+        }
+        // First visit without a key: walk the user straight to the dialog.
+        if (getApiKey().isEmpty()) {
+            showKeyDialog(showHint = true)
+        }
+    }
+
+    /** Hide the chat overlay; the conversation stays alive for the session. */
+    private fun closeChat() {
+        chatInput.clearFocus()
+        chatOverlay.visibility = View.GONE
+    }
+
+    /** Send button: push the user message into the list and start the request. */
+    private fun sendChatMessage() {
+        if (chatRequestInFlight) return
+        val text = chatInput.text.toString().trim()
+        if (text.isEmpty()) return
+        val key = getApiKey()
+        if (key.isEmpty()) {
+            showKeyDialog(showHint = true)
+            return
+        }
+        val model = getModel()
+
+        chatInput.setText("")
+        chatHistory.add(ChatTurn("user", text))
+        addUserBubble(text)
+
+        // Snapshot the payload here on the UI thread (fixed system prompt +
+        // the last CHAT_HISTORY_LIMIT turns, which includes the new user
+        // message), so the background thread never races later list edits.
+        val messages = JSONArray().put(
+            JSONObject().put("role", "system").put("content", CHAT_SYSTEM_PROMPT)
+        )
+        for (turn in chatHistory.takeLast(CHAT_HISTORY_LIMIT)) {
+            messages.put(JSONObject().put("role", turn.role).put("content", turn.content))
+        }
+
+        chatRequestInFlight = true
+        chatSend.isEnabled = false
+        chatSend.alpha = 0.4f
+        chatThinkingView = addThinkingBubble()
+
+        Thread({ runChatRequest(key, model, messages) }, "cosmos-chat").start()
+    }
+
+    /**
+     * Background path for one completion request. Tries with the web_search
+     * tool first; on an HTTP 400 that blames the tools, retries exactly once
+     * without them and flags the outcome so the UI can add a note bubble.
+     */
+    private fun runChatRequest(key: String, model: String, messages: JSONArray) {
+        val outcome = try {
+            val first = postChatCompletion(key, model, messages, withTools = true)
+            when {
+                first.httpCode in 200..299 -> parseChatReply(first.body)
+                first.httpCode == 400 && toolsBlamedIn(first.body) -> {
+                    val retry = postChatCompletion(key, model, messages, withTools = false)
+                    if (retry.httpCode in 200..299) {
+                        parseChatReply(retry.body).copy(fallbackUsed = true)
+                    } else {
+                        ChatOutcome(null, null, retry.httpCode, apiErrorMessage(retry.body), true)
+                    }
+                }
+                else -> ChatOutcome(null, null, first.httpCode, apiErrorMessage(first.body), false)
+            }
+        } catch (e: Exception) {
+            // Transport failures: DNS, connect/read timeout, refused, etc.
+            ChatOutcome(null, null, CHAT_ERROR_NETWORK, e.message ?: e.javaClass.simpleName, false)
+        }
+        runOnUiThread { onChatOutcome(outcome) }
+    }
+
+    /** UI-thread completion: swap the "Thinking…" bubble for the reply/error. */
+    private fun onChatOutcome(outcome: ChatOutcome) {
+        chatRequestInFlight = false
+        chatSend.isEnabled = true
+        chatSend.alpha = 1f
+        removeThinkingBubble()
+        if (outcome.reply != null) {
+            chatHistory.add(ChatTurn("assistant", outcome.reply))
+            if (outcome.fallbackUsed) {
+                addNoteBubble(getString(R.string.chat_fallback_note))
+            }
+            addAssistantBubble(outcome.reply, outcome.sources)
+            return
+        }
+        val detail = outcome.errorMessage ?: ""
+        val message = when (outcome.errorCode) {
+            CHAT_ERROR_NETWORK -> getString(R.string.chat_network_error, detail)
+            CHAT_ERROR_BAD_REPLY -> getString(R.string.chat_empty_reply)
+            // Missing/revoked credentials: point at the Key dialog.
+            401, 403 -> getString(R.string.chat_api_error, outcome.errorCode, detail) +
+                "\n\n" + getString(R.string.chat_key_error_hint)
+            else -> getString(R.string.chat_api_error, outcome.errorCode, detail)
+        }
+        addErrorBubble(message)
+    }
+
+    /**
+     * One synchronous POST to the chat API. Called only from the chat
+     * background thread; returns the raw status code and response body.
+     */
+    private fun postChatCompletion(
+        key: String,
+        model: String,
+        messages: JSONArray,
+        withTools: Boolean,
+    ): ChatHttpResponse {
+        val payload = JSONObject()
+            .put("model", model)
+            .put("messages", messages)
+        if (withTools) {
+            payload.put(
+                "tools",
+                JSONArray().put(
+                    JSONObject()
+                        .put("type", "web_search")
+                        .put("web_search", JSONObject().put("enable", true))
+                )
+            )
+        }
+        payload.put("stream", false)
+        payload.put("temperature", 0.6)
+        payload.put("max_tokens", 2048)
+
+        val connection = URL(CHAT_API_URL).openConnection() as HttpURLConnection
+        try {
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 15_000
+            connection.readTimeout = 120_000
+            connection.doOutput = true
+            connection.setRequestProperty("Authorization", "Bearer $key")
+            connection.setRequestProperty("Content-Type", "application/json")
+            connection.outputStream.use { out ->
+                out.write(payload.toString().toByteArray(StandardCharsets.UTF_8))
+            }
+            val code = connection.responseCode
+            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val body = stream?.use { it.readBytes().toString(StandardCharsets.UTF_8) } ?: ""
+            return ChatHttpResponse(code, body)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    /** Extract the reply text and optional source names from a 200 body. */
+    private fun parseChatReply(body: String): ChatOutcome {
+        return try {
+            val message = JSONObject(body)
+                .optJSONArray("choices")
+                ?.optJSONObject(0)
+                ?.optJSONObject("message")
+                ?: return ChatOutcome(null, null, CHAT_ERROR_BAD_REPLY, null, false)
+            val content = message.optString("content").trim()
+            if (content.isEmpty()) {
+                ChatOutcome(null, null, CHAT_ERROR_BAD_REPLY, null, false)
+            } else {
+                ChatOutcome(content, extractSourceNames(message), 200, null, false)
+            }
+        } catch (e: Exception) {
+            ChatOutcome(null, null, CHAT_ERROR_BAD_REPLY, null, false)
+        }
+    }
+
+    /**
+     * Best-effort "Sources:" names from the message's web_search array. The
+     * item shape is not documented, so try the plausible site-name fields and
+     * fall back to the link host; give up quietly when nothing parses.
+     */
+    private fun extractSourceNames(message: JSONObject): String? {
+        val items = message.optJSONArray("web_search") ?: return null
+        val names = LinkedHashSet<String>()
+        for (i in 0 until items.length()) {
+            val item = items.optJSONObject(i) ?: continue
+            val name = listOf(
+                item.optString("site_name"),
+                item.optString("media"),
+                urlHost(item.optString("link")),
+                urlHost(item.optString("url")),
+            ).firstOrNull { it.isNotBlank() } ?: continue
+            names.add(name)
+            if (names.size == CHAT_SOURCE_LIMIT) break
+        }
+        return if (names.isEmpty()) null else names.joinToString(", ")
+    }
+
+    private fun urlHost(url: String): String {
+        if (url.isBlank()) return ""
+        return try {
+            Uri.parse(url).host ?: ""
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    /** True when an HTTP 400 body points at the tools/web_search field. */
+    private fun toolsBlamedIn(body: String): Boolean {
+        val lower = body.lowercase(Locale.US)
+        return "tool" in lower || "web_search" in lower
+    }
+
+    /** Pull the API's error message out of a non-200 body, defensively. */
+    private fun apiErrorMessage(body: String): String {
+        val fallback = body.take(300)
+        return try {
+            JSONObject(body).optJSONObject("error")?.optString("message")
+                ?.takeIf { it.isNotBlank() } ?: fallback
+        } catch (e: Exception) {
+            fallback
+        }
+    }
+
+    /** Append one bubble TextView to [chatList] and scroll it into view. */
+    private fun addChatBubble(text: CharSequence, fromUser: Boolean): TextView {
+        val bubble = TextView(this)
+        bubble.text = text
+        bubble.textSize = 15f
+        bubble.setTextColor(BUBBLE_TEXT_COLOR)
+        bubble.setPadding(dp(14), dp(10), dp(14), dp(10))
+        // Never wider than ~3/4 of the screen, whatever the message length.
+        bubble.maxWidth = (resources.displayMetrics.widthPixels * 0.78f).toInt()
+
+        val background = GradientDrawable()
+        background.setColor(if (fromUser) BUBBLE_USER_BG else BUBBLE_ASSISTANT_BG)
+        background.cornerRadius = dp(16).toFloat()
+        bubble.background = background
+
+        val params = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        )
+        params.gravity = if (fromUser) Gravity.END else Gravity.START
+        params.topMargin = dp(8)
+        chatList.addView(bubble, params)
+        scrollChatToBottom()
+        return bubble
+    }
+
+    private fun addUserBubble(text: String) {
+        addChatBubble(text, fromUser = true)
+    }
+
+    /** Assistant reply; the optional sources line is dimmed inside the bubble. */
+    private fun addAssistantBubble(reply: String, sources: String?) {
+        var text: CharSequence = reply
+        if (sources != null) {
+            val separator = "\n\n"
+            val full = reply + separator + getString(R.string.chat_sources_prefix, sources)
+            val spannable = SpannableString(full)
+            spannable.setSpan(
+                ForegroundColorSpan(BUBBLE_MUTED_COLOR),
+                reply.length + separator.length,
+                full.length,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+            text = spannable
+        }
+        addChatBubble(text, fromUser = false).setTextIsSelectable(true)
+    }
+
+    /** Small muted system note (e.g. the no-web-search fallback notice). */
+    private fun addNoteBubble(text: String) {
+        val bubble = addChatBubble(text, fromUser = false)
+        bubble.textSize = 12f
+        bubble.setTextColor(BUBBLE_MUTED_COLOR)
+    }
+
+    /** Transient "Thinking…" placeholder; kept so it can be removed later. */
+    private fun addThinkingBubble(): TextView {
+        val bubble = addChatBubble(getString(R.string.chat_thinking), fromUser = false)
+        bubble.setTextColor(BUBBLE_MUTED_COLOR)
+        return bubble
+    }
+
+    private fun removeThinkingBubble() {
+        chatThinkingView?.let { chatList.removeView(it) }
+        chatThinkingView = null
+    }
+
+    /** Red-tinted assistant bubble for API/network failures. */
+    private fun addErrorBubble(text: String) {
+        val bubble = addChatBubble(text, fromUser = false)
+        val background = GradientDrawable()
+        background.setColor(BUBBLE_ERROR_BG)
+        background.cornerRadius = dp(16).toFloat()
+        bubble.background = background
+        bubble.setTextColor(BUBBLE_ERROR_TEXT)
+    }
+
+    private fun scrollChatToBottom() {
+        chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    /**
+     * Dialog for the Z.ai API key and model, built in code (no extra layout
+     * resource). Values live in SharedPreferences and are never logged.
+     */
+    private fun showKeyDialog(showHint: Boolean) {
+        val prefs = getSharedPreferences(CHAT_PREFS_NAME, MODE_PRIVATE)
+        val keyInput = EditText(this).apply {
+            hint = getString(R.string.chat_key_field_hint)
+            setText(prefs.getString(PREF_API_KEY, ""))
+            singleLine = true
+        }
+        val modelInput = EditText(this).apply {
+            hint = getString(R.string.chat_model_field_hint)
+            setText(prefs.getString(PREF_MODEL, DEFAULT_MODEL))
+            singleLine = true
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+        }
+        if (showHint) {
+            container.addView(TextView(this).apply {
+                text = getString(R.string.chat_set_key_hint)
+                textSize = 13f
+                setTextColor(BUBBLE_MUTED_COLOR)
+            })
+        }
+        container.addView(
+            keyInput,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(10) }
+        )
+        container.addView(
+            modelInput,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(10) }
+        )
+
+        AlertDialog.Builder(this)
+            .setTitle(R.string.chat_key_dialog_title)
+            .setView(container)
+            .setPositiveButton(R.string.chat_save) { _, _ ->
+                prefs.edit()
+                    .putString(PREF_API_KEY, keyInput.text.toString().trim())
+                    .putString(PREF_MODEL, modelInput.text.toString().trim().ifEmpty { DEFAULT_MODEL })
+                    .apply()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun getApiKey(): String =
+        getSharedPreferences(CHAT_PREFS_NAME, MODE_PRIVATE).getString(PREF_API_KEY, "").orEmpty()
+
+    private fun getModel(): String =
+        getSharedPreferences(CHAT_PREFS_NAME, MODE_PRIVATE)
+            .getString(PREF_MODEL, DEFAULT_MODEL)?.takeIf { it.isNotBlank() } ?: DEFAULT_MODEL
+
+    /** Density-independent pixel helper for the programmatic chat chrome. */
+    private fun dp(value: Int): Int =
+        TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP,
+            value.toFloat(),
+            resources.displayMetrics
+        ).roundToInt()
+
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
-        // Back closes the article first, then a page of it at a time, before
-        // it is allowed to leave the report.
+        // Back closes the article first, then the chat overlay (the
+        // conversation stays in memory for the session), then a report page
+        // at a time, before it is allowed to leave the report.
         if (articleOverlay.visibility == View.VISIBLE) {
             goArticleBack()
+            return
+        }
+        if (chatOverlay.visibility == View.VISIBLE) {
+            closeChat()
             return
         }
         // Then walk the report itself: past issue -> history page -> today's
@@ -347,8 +786,10 @@ class MainActivity : Activity() {
             h1{font-size:18px;margin:0 0 12px}.muted{color:#667085;font-size:12px}
             ul{list-style:none;padding:0;margin:0}li{margin:0 0 16px;font-size:15px}
             a{color:#174ea6;text-decoration:none}
+            .search{margin:0 0 20px}.search a{display:inline-block;padding:8px 14px;margin-left:-14px;font-size:14px}
             </style></head><body>
             <h1>Cosmos</h1>
+            <p class="search"><a href="cosmos://search">${getString(R.string.search_button)}</a></p>
             ${if (entries.isEmpty()) """<p class="muted">No saved issues yet.</p>""" else ""}
             <ul>$entries</ul>
             </body></html>
@@ -363,7 +804,63 @@ class MainActivity : Activity() {
         return year.toLong() * 10000 + month.toLong() * 100 + day.toLong()
     }
 
+    /** One conversation turn ("user" or "assistant") kept for the session. */
+    private data class ChatTurn(val role: String, val content: String)
+
+    /**
+     * Outcome of one chat request, ready for the UI thread: either a reply
+     * (with optional source names) or an error described by an HTTP status
+     * code, CHAT_ERROR_NETWORK (-1), or CHAT_ERROR_BAD_REPLY (0).
+     */
+    private data class ChatOutcome(
+        val reply: String?,
+        val sources: String?,
+        val errorCode: Int,
+        val errorMessage: String?,
+        val fallbackUsed: Boolean,
+    )
+
+    /** Raw status line of one HTTP exchange with the chat API. */
+    private class ChatHttpResponse(val httpCode: Int, val body: String)
+
     private companion object {
+        // --- GLM chat ("Search") constants ---
+
+        /** Z.ai OpenAI-compatible chat completions endpoint. */
+        private const val CHAT_API_URL = "https://api.z.ai/api/paas/v4/chat/completions"
+
+        /** Sent as the fixed system message ahead of the capped history. */
+        private const val CHAT_SYSTEM_PROMPT =
+            "You are Cosmos, the assistant inside a personal news reader. Be " +
+                "concise and factual. Use web search when the question needs " +
+                "fresh information."
+
+        /** Where the chat's API key and model name are stored. */
+        private const val CHAT_PREFS_NAME = "cosmos_settings"
+        private const val PREF_API_KEY = "api_key"
+        private const val PREF_MODEL = "model"
+
+        /** A genuinely free Z.ai model; glm-5.2 exists but is paid. */
+        private const val DEFAULT_MODEL = "glm-4.7-flash"
+
+        /** Turn cap for the request's message history, to bound tokens. */
+        private const val CHAT_HISTORY_LIMIT = 20
+
+        /** Max source names kept for the reply's "Sources:" line. */
+        private const val CHAT_SOURCE_LIMIT = 5
+
+        /** Error codes beyond HTTP: transport failure or a bad 200 payload. */
+        private const val CHAT_ERROR_NETWORK = -1
+        private const val CHAT_ERROR_BAD_REPLY = 0
+
+        /** Bubble palette; inline hex because no color resources may be added. */
+        private val BUBBLE_USER_BG = Color.parseColor("#E8F0FE")
+        private val BUBBLE_ASSISTANT_BG = Color.parseColor("#F1F3F4")
+        private val BUBBLE_TEXT_COLOR = Color.parseColor("#1F1F1F")
+        private val BUBBLE_MUTED_COLOR = Color.parseColor("#5F6368")
+        private val BUBBLE_ERROR_BG = Color.parseColor("#FCE8E6")
+        private val BUBBLE_ERROR_TEXT = Color.parseColor("#B3261E")
+
         /** Matches the pipeline's report filenames, e.g. 2026-09-15.html. */
         val ISSUE_NAME = Regex("""^(\d{4})-(\d{2})-(\d{2})\.html$""")
 
