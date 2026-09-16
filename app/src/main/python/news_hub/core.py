@@ -717,19 +717,6 @@ def _iso(point: Sequence[float]) -> tuple[float, float]:
     return (x - y) * _ISO_X, (x + y) * _ISO_Y - z
 
 
-def _rotate_iso(point: Sequence[float]) -> tuple[float, float]:
-    """Isometric projection followed by the 90° screen rotation about the origin.
-
-    The rotation ``(x, y) -> (-y, x)`` in projection space corresponds to the
-    screen transform ``(x, y) -> (y, -x)`` in SVG coordinates (where y grows
-    downward). It sends the corroboration axis from "up" to "left" and the
-    age/authority pair to the mirrored ±120° directions, so the whole map scene
-    turns rigidly together without changing any relative geometry.
-    """
-    x, y = _iso(point)
-    return -y, x
-
-
 #: Single-letter prefixes for the map labels, so a marker points at a section entry.
 CATEGORY_LETTERS: dict[str, str] = {"Technology": "T", "Geopolitics": "G", "Economics": "E"}
 
@@ -794,44 +781,84 @@ def _map_frame(
     return (center_x - span / 2.0, center_y - span / 2.0, span, span)
 
 
-def _axis_reach(
-    origin: tuple[float, float],
-    ux: float,
-    uy: float,
-    width: float,
-    height: float,
-    pad: float,
-) -> float:
-    """How far a ray from ``origin`` along the screen unit ``(ux, uy)`` stays in view."""
-    reach = float("inf")
-    if abs(ux) > 1e-12:
-        edge_x = width - pad if ux > 0 else pad
-        reach = min(reach, (edge_x - origin[0]) / ux)
-    if abs(uy) > 1e-12:
-        edge_y = height - pad if uy > 0 else pad
-        reach = min(reach, (edge_y - origin[1]) / uy)
-    return max(0.0, reach)
+#: Padding around the drawn data inside the SVG salience map, in px. The two
+#: flat axes, arrowheads and labels live inside this margin, and the
+#: label-extent guard keeps every text box inside it.
+MAP_PADDING = 30.0
+
+#: Font size of the map's axis and marker labels, in px.
+MAP_LABEL_FONT_SIZE = 11.0
+
+#: Estimated rendered width of one character at :data:`MAP_LABEL_FONT_SIZE`, in px.
+MAP_LABEL_CHAR_WIDTH = 6.2
 
 
-#: Screen-space unit directions (SVG y grows downward) of the drawn graph
-#: axes, in :data:`geometry.TRUST_AXES` order, after the 90° screen rotation
-#: that sends corroboration from "up" to "left": age up-right, authority
-#: down-right, corroboration left, still at exact 120° separations. These
-#: describe the frame only — data positions come from :func:`_rotate_iso`.
-AXIS_DIRECTIONS: tuple[tuple[float, float], ...] = (
-    (_ISO_Y, -_ISO_X),
-    (_ISO_Y, _ISO_X),
-    (-1.0, 0.0),
-)
+def _xy(point: Sequence[float]) -> tuple[float, float]:
+    """Project a trust point onto the salience map's 2-D x-y plane.
 
-#: Axis length as a share of the frame span, and tick positions along it.
-AXIS_LENGTH_FRACTION = 0.42
-AXIS_TICKS: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8)
-#: How far the arrowhead and its label extend past the axis line, in px. The
-#: axis is shortened by this much so the label anchor stays on the padded canvas
-#: no matter which way the rotated frame points.
-AXIS_ARROW_EXTENT = 8.0
-AXIS_LABEL_GAP = 11.0
+    The map plots ``(age, authority)`` deficits only; corroboration is excluded
+    from this view.
+    """
+    return float(point[0]), float(point[1])
+
+
+def _estimated_text_width(text: str, font_size: float = MAP_LABEL_FONT_SIZE) -> float:
+    """Estimated rendered width of ``text`` at ``font_size`` px."""
+    return len(text) * MAP_LABEL_CHAR_WIDTH * (font_size / MAP_LABEL_FONT_SIZE)
+
+
+def _text_box(
+    x: float,
+    y: float,
+    text: str,
+    anchor: str = "start",
+    font_size: float = MAP_LABEL_FONT_SIZE,
+) -> tuple[float, float, float, float]:
+    """Estimated ``(left, top, right, bottom)`` screen box of a text element.
+
+    Shared by the renderer and the tests so the label-extent guarantee is
+    computed from one definition.
+    """
+    width = _estimated_text_width(text, font_size)
+    if anchor == "middle":
+        left, right = x - width / 2.0, x + width / 2.0
+    elif anchor == "end":
+        left, right = x - width, x
+    else:
+        left, right = x, x + width
+    top = y - font_size
+    bottom = y + font_size * 0.2
+    return left, top, right, bottom
+
+
+def _clamp_label(
+    x: float,
+    y: float,
+    text: str,
+    anchor: str,
+    width: int,
+    height: int,
+    pad: float = MAP_PADDING,
+) -> tuple[float, float, str]:
+    """Shift a text anchor so its estimated box stays inside the padded canvas.
+
+    This is the label-extent guard: an anchor point can itself sit in-bounds
+    while the glyphs it introduces still spill past the canvas edge, so every
+    ``<text>`` element is nudged before it is emitted.
+    """
+    anchor = anchor or "start"
+    left, top, right, bottom = _text_box(x, y, text, anchor)
+    min_x, max_x = pad, width - pad
+    min_y, max_y = pad, height - pad
+    if left < min_x:
+        x += min_x - left
+    elif right > max_x:
+        x -= right - max_x
+    if top < min_y:
+        y += min_y - top
+    elif bottom > max_y:
+        y -= bottom - max_y
+    return x, y, anchor
 
 
 def render_ascii_map(
@@ -941,31 +968,134 @@ def render_radius_histogram(
     return "\n".join(lines)
 
 
-def _inside_frame(point: tuple[float, float], frame: tuple[float, float, float, float]) -> bool:
-    low_x, low_y, span_x, span_y = frame
-    return low_x <= point[0] <= low_x + span_x and low_y <= point[1] <= low_y + span_y
+def _map_frame_2d(
+    points: Sequence[Sequence[float]],
+    padding: float = 0.12,
+) -> tuple[float, float, float, float]:
+    """Bounding box of 2-D ``(age, authority)`` points with symmetric padding.
 
-
-def _map_frame_and_context(
-    stories: Sequence[Story],
-    rejected: Sequence[Story],
-    star: float,
-    metric: geometry.Metric | None = None,
-    samples: int = 260,
-    project: Callable[[Sequence[float]], tuple[float, float]] = _iso,
-) -> tuple[tuple[float, float, float, float], list[tuple[float, float, float]], list[Story]]:
-    """Frame the map on the selection, keeping only the context that fits inside it.
-
-    Sizing the frame to every collected lead compresses the chosen items into a
-    few pixels, so the frame follows the selection and the surface and rejected
-    leads are drawn only where they land inside it. The caller reports how many
-    did not fit, because a clipped cloud must never read as "nothing else was
-    collected".
+    The SVG map frames the whole collected cloud on this box, so the chosen
+    items and the rejected context dots share one honest view. The 2-D plane is
+    not forced square, so each axis keeps its own span and its own padding.
     """
-    surface = _surface_points(star, metric, samples=samples)
-    frame = _map_frame([story.trust for story in stories] + surface, project=project)
-    visible = [story for story in rejected if _inside_frame(project(story.trust), frame)]
-    return frame, surface, visible
+    xs = [float(point[0]) for point in points]
+    ys = [float(point[1]) for point in points]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    span_x = max(1e-6, max_x - min_x)
+    span_y = max(1e-6, max_y - min_y)
+    pad_x = max(0.04, span_x * padding)
+    pad_y = max(0.04, span_y * padding)
+    return (min_x - pad_x, min_y - pad_y, span_x + 2.0 * pad_x, span_y + 2.0 * pad_y)
+
+
+#: Inline, dependency-free pan/zoom script emitted immediately after each map
+#: SVG. Scoped to ``svg.map`` elements and idempotent, so it only ever touches
+#: the salience map and never the surrounding report page.
+_PAN_ZOOM_SCRIPT = """<script>
+/* cosmos salience map pan/zoom — scoped to svg.map elements */
+(function () {
+  var maps = document.querySelectorAll("svg.map");
+  for (var i = 0; i < maps.length; i++) (function (svg) {
+    if (svg.__cosmosPanZoom) return;
+    svg.__cosmosPanZoom = true;
+    svg.style.touchAction = "none";
+    svg.style.cursor = "grab";
+    var vb = svg.viewBox && svg.viewBox.baseVal
+      ? [svg.viewBox.baseVal.x, svg.viewBox.baseVal.y, svg.viewBox.baseVal.width, svg.viewBox.baseVal.height]
+      : [0, 0, 560, 560];
+    var baseW = vb[2], baseH = vb[3];
+    var view = { x: vb[0], y: vb[1], w: vb[2], h: vb[3] };
+    var MIN = 0.5, MAX = 6, PAN = 2.5;
+
+    function apply() { svg.setAttribute("viewBox", view.x + " " + view.y + " " + view.w + " " + view.h); }
+    function clamp() {
+      var s = baseW / view.w;
+      if (s < MIN) { view.w = baseW / MIN; view.h = baseH / MIN; }
+      else if (s > MAX) { view.w = baseW / MAX; view.h = baseH / MAX; }
+      var mw = PAN * view.w, mh = PAN * view.h;
+      view.x = Math.max(-mw, Math.min(mw, view.x));
+      view.y = Math.max(-mh, Math.min(mh, view.y));
+    }
+    function at(cx, cy) {
+      var r = svg.getBoundingClientRect();
+      return { x: view.x + (cx - r.left) / r.width * view.w, y: view.y + (cy - r.top) / r.height * view.h };
+    }
+    function zoom(f, cx, cy) {
+      var p = at(cx, cy);
+      var nw = view.w / f;
+      var s = nw / view.w;
+      view.x = p.x - (p.x - view.x) * s;
+      view.y = p.y - (p.y - view.y) * s;
+      view.w = nw; view.h = baseH / baseW * nw;
+      clamp(); apply();
+    }
+    function dist(a, b) {
+      var dx = a.clientX - b.clientX, dy = a.clientY - b.clientY;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    var pointers = {}, drag = null, pinch = null, lastTap = 0;
+
+    function down(e) {
+      pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+      var ids = Object.keys(pointers);
+      if (ids.length === 1) {
+        drag = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: 0 };
+        if (svg.setPointerCapture) svg.setPointerCapture(e.pointerId);
+        svg.style.cursor = "grabbing";
+      } else if (ids.length === 2) {
+        pinch = { d: dist(pointers[ids[0]], pointers[ids[1]]) };
+        drag = null;
+      }
+    }
+    function move(e) {
+      if (!pointers[e.pointerId]) return;
+      pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+      var ids = Object.keys(pointers);
+      if (ids.length === 2 && pinch) {
+        var d = dist(pointers[ids[0]], pointers[ids[1]]);
+        var cx = (pointers[ids[0]].x + pointers[ids[1]].x) / 2;
+        var cy = (pointers[ids[0]].y + pointers[ids[1]].y) / 2;
+        zoom(d / pinch.d, cx, cy);
+        pinch.d = d;
+      } else if (drag && drag.id === e.pointerId) {
+        var r = svg.getBoundingClientRect();
+        var dx = (e.clientX - drag.x) / r.width * view.w;
+        var dy = (e.clientY - drag.y) / r.height * view.h;
+        drag.moved += Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y);
+        drag.x = e.clientX; drag.y = e.clientY;
+        view.x -= dx; view.y -= dy;
+        clamp(); apply();
+      }
+    }
+    function up(e) {
+      var wasDrag = drag && drag.id === e.pointerId;
+      var wasTap = wasDrag && drag.moved < 6;
+      delete pointers[e.pointerId];
+      if (wasDrag) {
+        svg.style.cursor = "grab";
+        drag = null;
+        if (wasTap) {
+          var now = Date.now();
+          if (now - lastTap < 300) { zoom(2, e.clientX, e.clientY); lastTap = 0; }
+          else lastTap = now;
+        }
+      }
+      if (Object.keys(pointers).length < 2) pinch = null;
+    }
+
+    svg.addEventListener("pointerdown", down);
+    svg.addEventListener("pointermove", move);
+    svg.addEventListener("pointerup", up);
+    svg.addEventListener("pointercancel", up);
+    svg.addEventListener("wheel", function (e) {
+      e.preventDefault();
+      zoom(e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX, e.clientY);
+    }, { passive: false });
+  })(maps[i]);
+})();
+</script>"""
 
 
 def _render_map_svg(
@@ -977,117 +1107,108 @@ def _render_map_svg(
     width: int = 560,
     height: int = 560,
 ) -> str:
-    """Inline SVG of the same cube the text map draws, with in-frame context leads.
+    """Inline SVG of the salience map as a clean 2-D age × authority plane.
 
-    Drawn as a light isometric graph rather than a filled shape: every selected
-    story carries a thin vector from the projected origin — where the three axes
-    meet — to its dot, so each vector's length and direction read as that item's
-    deficit magnitude and direction. The frame around them is a real three-axis
-    system — arrowheads, ticks and the actual axis names — with corroboration
-    pointing left and the other two at ±120° from it, over a faint dashed floor
-    grid. Nothing here is filled dark and no backdrop is painted, so the report's
-    own paper tone shows through. Data points, labels and markers keep their
-    positions and colors exactly.
+    Every collected item — the chosen stories and the rejected leads alike — is
+    plotted at ``(age deficit, authority deficit)``; corroboration is left out
+    of this view. Authority grows upward (negative SVG y), age grows to the
+    right, and the origin (fresh, authoritative) sits at the bottom-left of the
+    frame. Each chosen story carries a thin vector from that origin to its dot,
+    so a vector's length and direction are the item's deficit magnitude and
+    direction. The frame is fitted to the whole data cloud with symmetric
+    padding; two flat axes sit along the bottom and left edges with arrowheads
+    at their positive ends, faint gridlines sit behind the data, and an inline
+    script (immediately after the SVG) makes the map draggable and zoomable.
     """
-    frame, _, visible = _map_frame_and_context(stories, rejected, star, metric, project=_rotate_iso)
-    low_x, low_y, span_x, span_y = frame
-    pad = 26.0
-    scale = min((width - 2 * pad) / span_x, (height - 2 * pad) / span_y)
-    offset_x = (width - span_x * scale) / 2.0
-    offset_y = (height - span_y * scale) / 2.0
+    pad = MAP_PADDING
+    plot_w = width - 2.0 * pad
+    plot_h = height - 2.0 * pad
+
+    # Frame the 2-D plane on the whole collected cloud (selected + context dots).
+    cloud = [_xy(story.trust) for story in stories]
+    cloud.extend(_xy(story.trust) for story in rejected)
+    low_x, low_y, span_x, span_y = _map_frame_2d(cloud)
 
     def to_screen(point: Sequence[float]) -> tuple[float, float]:
-        x, y = _rotate_iso(point)
-        sx = offset_x + (x - low_x) * scale
-        sy = offset_y + (1.0 - (y - low_y) / span_y) * span_y * scale
+        x, y = _xy(point)
+        sx = pad + (x - low_x) / span_x * plot_w
+        sy = pad + (1.0 - (y - low_y) / span_y) * plot_h
         return sx, sy
 
-    origin = to_screen((0.0, 0.0, 0.0))
+    # The origin (age=0, authority=0) sits below-left of any non-negative
+    # deficit, so it usually lands at the plot corner; clamp it into the frame.
+    origin_x, origin_y = to_screen((0.0, 0.0))
+    origin_x = min(max(pad, origin_x), width - pad)
+    origin_y = min(max(pad, origin_y), height - pad)
 
-    # The 3-D graph frame: three axes from the projected origin with
-    # corroboration pointing left and age/authority at ±120° from it (up-right
-    # and down-right), each long enough to read as a graph axis yet clipped so
-    # arrowhead and label stay on canvas.
-    span_screen = span_x * scale
-    axis_geometry = [
-        (
-            name,
-            ux,
-            uy,
-            min(
-                AXIS_LENGTH_FRACTION * span_screen,
-                max(0.0, _axis_reach(origin, ux, uy, width, height, pad) - AXIS_ARROW_EXTENT - AXIS_LABEL_GAP),
-            ),
-        )
-        for name, (ux, uy) in zip(geometry.TRUST_AXES, AXIS_DIRECTIONS)
-    ]
-
-    # Floor grid: the x-y plane of that frame, dashed and barely visible, drawn
-    # first so it sits behind the data. Its near edges are the two axes.
-    floor: list[str] = []
-    _, x_ux, x_uy, x_len = axis_geometry[0]
-    _, y_ux, y_uy, y_len = axis_geometry[1]
-    x_vector = (x_ux * x_len, x_uy * x_len)
-    y_vector = (y_ux * y_len, y_uy * y_len)
-
-    def floor_line(start: tuple[float, float], end: tuple[float, float]) -> None:
-        floor.append(
-            f'<line x1="{start[0]:.1f}" y1="{start[1]:.1f}" x2="{end[0]:.1f}" y2="{end[1]:.1f}"/>'
+    def text_element(x: float, y: float, text: str, anchor: str, cls: str, color: str) -> str:
+        lx, ly, la = _clamp_label(x, y, text, anchor, width, height, pad)
+        return (
+            f'<text class="{cls}" x="{lx:.1f}" y="{ly:.1f}" text-anchor="{la}" '
+            f'font-size="11" fill="{color}">{_esc(text)}</text>'
         )
 
-    for fraction in (1.0 / 3.0, 2.0 / 3.0, 1.0):
-        along_x = (origin[0] + fraction * x_vector[0], origin[1] + fraction * x_vector[1])
-        floor_line(along_x, (along_x[0] + y_vector[0], along_x[1] + y_vector[1]))
-        along_y = (origin[0] + fraction * y_vector[0], origin[1] + fraction * y_vector[1])
-        floor_line(along_y, (along_y[0] + x_vector[0], along_y[1] + x_vector[1]))
-
+    # Faint reference gridlines plus modest ticks on the two flat axes.
+    grid: list[str] = []
     axes: list[str] = []
-    for name, ux, uy, length in axis_geometry:
-        base_x, base_y = origin[0] + ux * length, origin[1] + uy * length
-        tip_x, tip_y = origin[0] + ux * (length + AXIS_ARROW_EXTENT), origin[1] + uy * (length + AXIS_ARROW_EXTENT)
-        normal_x, normal_y = -uy, ux
+    for fraction in (0.25, 0.5, 0.75):
+        gx = pad + fraction * plot_w
+        gy = pad + (1.0 - fraction) * plot_h
+        grid.append(f'<line x1="{gx:.1f}" y1="{pad:.1f}" x2="{gx:.1f}" y2="{height - pad:.1f}"/>')
+        grid.append(f'<line x1="{pad:.1f}" y1="{gy:.1f}" x2="{width - pad:.1f}" y2="{gy:.1f}"/>')
         axes.append(
-            f'<line class="axis" x1="{origin[0]:.1f}" y1="{origin[1]:.1f}" '
-            f'x2="{base_x:.1f}" y2="{base_y:.1f}"/>'
-        )
-        for fraction in AXIS_TICKS:
-            tick_x, tick_y = origin[0] + ux * length * fraction, origin[1] + uy * length * fraction
-            axes.append(
-                f'<line class="axis-tick" stroke-width="0.8" stroke-opacity="0.7" '
-                f'x1="{tick_x - 3.0 * normal_x:.1f}" y1="{tick_y - 3.0 * normal_y:.1f}" '
-                f'x2="{tick_x + 3.0 * normal_x:.1f}" y2="{tick_y + 3.0 * normal_y:.1f}"/>'
-            )
-        axes.append(
-            f'<path class="axis-arrow" fill="#667085" stroke="none" '
-            f'd="M {tip_x:.1f} {tip_y:.1f} L {base_x + 3.0 * normal_x:.1f} {base_y + 3.0 * normal_y:.1f} '
-            f'L {base_x - 3.0 * normal_x:.1f} {base_y - 3.0 * normal_y:.1f} Z"/>'
+            f'<line class="axis-tick" stroke-width="0.8" stroke-opacity="0.7" '
+            f'x1="{gx:.1f}" y1="{origin_y - 3.5:.1f}" x2="{gx:.1f}" y2="{origin_y + 3.5:.1f}"/>'
         )
         axes.append(
-            f'<text class="axlabel" x="{tip_x + AXIS_LABEL_GAP * ux:.1f}" y="{tip_y + AXIS_LABEL_GAP * uy:.1f}" '
-            f'text-anchor="middle" font-size="10" fill="#667085">{_esc(name)}</text>'
+            f'<line class="axis-tick" stroke-width="0.8" stroke-opacity="0.7" '
+            f'x1="{origin_x - 3.5:.1f}" y1="{gy:.1f}" x2="{origin_x + 3.5:.1f}" y2="{gy:.1f}"/>'
         )
 
-    parts: list[str] = []
-    parts.append(
-        '<g class="floor" stroke="#b6c2d4" stroke-width="0.6" stroke-dasharray="3 4" '
-        f'stroke-opacity="0.55" fill="none">{"".join(floor)}</g>'
+    # The two flat axes along the bottom (age, arrow right) and left
+    # (authority, arrow up) edges, meeting at the origin corner.
+    axes.extend(
+        [
+            f'<line class="axis" x1="{pad:.1f}" y1="{origin_y:.1f}" x2="{width - pad:.1f}" y2="{origin_y:.1f}"/>',
+            f'<line class="axis" x1="{origin_x:.1f}" y1="{height - pad:.1f}" x2="{origin_x:.1f}" y2="{pad:.1f}"/>',
+        ]
+    )
+    axes.append(
+        f'<path class="axis-arrow" fill="#667085" stroke="none" '
+        f'd="M {width - pad:.1f} {origin_y:.1f} L {width - pad - 7:.1f} {origin_y - 3.5:.1f} '
+        f'L {width - pad - 7:.1f} {origin_y + 3.5:.1f} Z"/>'
+    )
+    axes.append(
+        f'<path class="axis-arrow" fill="#667085" stroke="none" '
+        f'd="M {origin_x:.1f} {pad:.1f} L {origin_x - 3.5:.1f} {pad + 7:.1f} '
+        f'L {origin_x + 3.5:.1f} {pad + 7:.1f} Z"/>'
+    )
+    # Subtle origin mark: a tiny slash at the corner, with no text.
+    axes.append(
+        f'<path class="origin-mark" stroke-width="1.2" '
+        f'd="M {origin_x - 3:.1f} {origin_y + 3:.1f} L {origin_x + 3:.1f} {origin_y - 3:.1f}"/>'
+    )
+    # Axis labels at the positive ends, clamped into the canvas.
+    axes.append(text_element(width - pad - 4.0, origin_y - 7.0, "age", "end", "axlabel", "#667085"))
+    axes.append(
+        text_element(origin_x + 6.0, pad + MAP_LABEL_FONT_SIZE + 4.0, "authority", "start", "axlabel", "#667085")
     )
 
-    # Each selected story gets a thin vector from the projected origin to its
-    # dot, so the set of vectors reads as spokes of the graph: a vector's
-    # length and direction are that item's deficit magnitude and direction.
-    # The dots themselves are nudged apart for legibility, so each vector ends
-    # on the same nudged centre as the dot it belongs to, and the whole group
-    # is painted beneath the data (right after the floor grid).
+    parts: list[str] = [
+        f'<g class="grid" stroke="#eef1f6" stroke-width="0.6" fill="none">{"".join(grid)}</g>'
+    ]
+
+    # One thin, low-opacity vector per chosen story, from the origin to the
+    # same nudged centre as the story's dot.
     positions = []
     for index, story in enumerate(stories):
         sx, sy = to_screen(story.trust)
-        # Deterministic nudge so items that agree on all three trust axes stay visible.
+        # Deterministic nudge so items that agree on both trust axes stay visible.
         sx += 5.0 * math.cos(index * 2.399)
         sy += 5.0 * math.sin(index * 2.399)
         positions.append((sx, sy))
     vectors = [
-        f'<line class="vector" x1="{origin[0]:.1f}" y1="{origin[1]:.1f}" x2="{sx:.1f}" y2="{sy:.1f}"/>'
+        f'<line class="vector" x1="{origin_x:.1f}" y1="{origin_y:.1f}" x2="{sx:.1f}" y2="{sy:.1f}"/>'
         for sx, sy in positions
     ]
     parts.append(
@@ -1095,13 +1216,12 @@ def _render_map_svg(
         f'fill="none">{"".join(vectors)}</g>'
     )
 
-    parts.append('<g class="cloud">')
-    for story in visible[:400]:
-        sx, sy = to_screen(story.trust)
-        parts.append(
-            f'<circle cx="{sx:.1f}" cy="{sy:.1f}" r="1.6" fill="#b9c2d0" fill-opacity="0.45"/>'
-        )
-    parts.append("</g>")
+    # Grey context dots: every rejected lead, painted behind the axes.
+    cloud_parts = [
+        f'<circle cx="{sx:.1f}" cy="{sy:.1f}" r="1.6" fill="#b9c2d0" fill-opacity="0.45"/>'
+        for sx, sy in (to_screen(story.trust) for story in rejected[:400])
+    ]
+    parts.append(f'<g class="cloud">{"".join(cloud_parts)}</g>')
 
     parts.append(
         '<g class="axes" stroke="#667085" stroke-width="1" stroke-opacity="0.85" fill="none">'
@@ -1118,16 +1238,13 @@ def _render_map_svg(
             f'{story.radius:.3f}</title></circle>'
         )
         marker = (labels or {}).get(id(story), str(index))
-        parts.append(
-            f'<text class="marker" x="{sx + size + 1.5:.1f}" y="{sy + 3.5:.1f}" '
-            f'font-size="10" fill="#334155">{_esc(marker)}</text>'
-        )
+        parts.append(text_element(sx + size + 1.5, sy + 3.5, marker, "start", "marker", "#334155"))
 
     return (
         f'<svg class="map" viewBox="0 0 {width} {height}" role="img" '
-        f'aria-label="Trust cube map of the selected stories with rejected leads in grey">'
+        f'aria-label="Salience map of age and authority deficits with rejected leads in grey">'
         f'{"".join(parts)}</svg>'
-    )
+    ) + _PAN_ZOOM_SCRIPT
 
 
 def _render_map_section(
@@ -1137,25 +1254,16 @@ def _render_map_section(
     labels: dict[int, str] | None = None,
     metric: geometry.Metric | None = None,
 ) -> str:
-    """The map plus an honest caption about what its frame actually shows."""
+    """The 2-D map plus a caption describing the age × authority plane."""
     if not stories:
         return '<p>Nothing met the selection bar, so there is no map to draw.</p>'
-    _, _, visible = _map_frame_and_context(stories, rejected, star, metric, project=_rotate_iso)
-    hidden = len(rejected) - len(visible)
-    note = (
-        f" The frame is fitted to the selection, so {hidden} of {len(rejected)} rejected leads sit outside it."
-        if hidden
-        else ""
-    )
     return (
-        '<p class="story-meta">Every item is plotted at its (age, authority, corroboration) deficits in an '
-        'isometric view of the trust cube. Each thin line runs from the projected origin — where the three '
-        'axes meet — to a chosen item\'s dot, so a line\'s length and direction are that story\'s deficit '
-        'magnitude and direction: shorter is stronger. The frame is fitted to the selection surface '
-        f'|d|_W = {star:.3f}, and the axis frame marks the age, authority and corroboration axes with '
-        'arrowheads, ticks and a dashed floor grid. Grey dots are rejected leads, and each marker is the '
-        'topic-section label of a chosen item (T = technology, G = geopolitics, E = economics).'
-        f"{note}</p>"
+        '<p class="story-meta">Every collected item is plotted by its age and authority deficits on a '
+        'flat x-y plane (corroboration is excluded from this view). Each thin line runs from the origin '
+        '— fresh and authoritative, at the bottom-left corner — to a chosen item\'s dot, so a line\'s '
+        'length and direction are that story\'s deficit magnitude and direction: shorter is stronger. '
+        'Grey dots are rejected leads, and each marker is the topic-section label of a chosen item '
+        '(T = technology, G = geopolitics, E = economics). Drag to pan · pinch or double-tap to zoom.</p>'
         + _render_map_svg(stories, star, rejected, labels, metric)
     )
 
@@ -1370,7 +1478,7 @@ Metric: <span class="coords">{_esc(metric.describe())}</span>. An item gets in o
 not because it won a leaderboard.</div>
 <section><h2>What changed</h2><ul>{executive or '<li>No live stories collected.</li>'}</ul></section>
 <section><h2>Problems to watch</h2><ul>{problems or '<li>No geopolitics/economics leads collected.</li>'}</ul></section>
-<section><h2>Salience map · trust cube</h2>
+<section><h2>Salience map · age × authority</h2>
 {_render_map_section(selection.stories, rejected, selection.radius, labels, metric)}
 </section>
 <section><h2>Topic regions</h2><div class="scroller">{_render_regions(stories, metric)}</div></section>

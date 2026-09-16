@@ -89,7 +89,7 @@ class MainActivity : Activity() {
 
     private fun configureWebView() {
         webView.settings.apply {
-            javaScriptEnabled = false // the report is static HTML; no JS needed
+            javaScriptEnabled = true   // only for the report's own inline map pan/zoom script
             allowFileAccess = true    // the report is loaded via file://
             allowContentAccess = true
             blockNetworkLoads = true  // report is self-contained (inline CSS/SVG)
@@ -207,6 +207,12 @@ class MainActivity : Activity() {
         // it is allowed to leave the report.
         if (articleOverlay.visibility == View.VISIBLE) {
             goArticleBack()
+            return
+        }
+        // Then walk the report itself: past issue -> history page -> today's
+        // report -> (nothing left) exit.
+        if (webView.canGoBack()) {
+            webView.goBack()
             return
         }
         super.onBackPressed()
@@ -336,13 +342,13 @@ class MainActivity : Activity() {
         }
 
         val html = """
-            <!doctype html><html><head><meta charset="utf-8"><title>Back issues</title><style>
+            <!doctype html><html><head><meta charset="utf-8"><title>Cosmos</title><style>
             body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#fff;max-width:900px;margin:40px auto;color:#172033;line-height:1.6;padding:0 16px}
             h1{font-size:18px;margin:0 0 12px}.muted{color:#667085;font-size:12px}
             ul{list-style:none;padding:0;margin:0}li{margin:0 0 16px;font-size:15px}
             a{color:#174ea6;text-decoration:none}
             </style></head><body>
-            <h1>Back issues</h1>
+            <h1>Cosmos</h1>
             ${if (entries.isEmpty()) """<p class="muted">No saved issues yet.</p>""" else ""}
             <ul>$entries</ul>
             </body></html>
