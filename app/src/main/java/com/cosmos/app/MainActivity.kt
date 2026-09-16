@@ -1,21 +1,25 @@
 package com.cosmos.app
 
 import android.app.Activity
-import android.app.AlertDialog
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import android.webkit.WebChromeClient
+import android.webkit.WebHistoryItem
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.ProgressBar
 import android.widget.TextView
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Date
 import java.util.Locale
 
 /**
@@ -23,10 +27,14 @@ import java.util.Locale
  * Python on a background thread, then display the generated HTML report in a
  * WebView -- or swap the loading screen's text for a readable error.
  *
- * The report view is read-only chrome around the brief, plus two ways to get
+ * The report view is read-only chrome around the brief, plus one way to get
  * more: tapping an article link opens it in a full-screen in-app browser
- * (never an external app or browser), and the history bar reopens any issue
- * the pipeline has already written to app-private storage.
+ * (never an external app or browser). Older issues are reached through the
+ * report's own "Back issues" footer link, which loads history.html -- a small
+ * index the app regenerates after every run -- in the same WebView.
+ *
+ * A same-day report already on disk is reused without re-running Python, so
+ * reopening the app never re-fetches the day's feeds.
  *
  * Framework widgets only (no AndroidX): the theme, WebView and views all come
  * from android.*, so the build has zero runtime dependencies beyond Chaquopy
@@ -41,11 +49,18 @@ class MainActivity : Activity() {
     private lateinit var statusTitle: TextView
     private lateinit var statusMessage: TextView
 
-    private lateinit var historyButton: TextView
     private lateinit var articleOverlay: View
     private lateinit var articleWebView: WebView
     private lateinit var articleUrlView: TextView
     private lateinit var articleProgress: ProgressBar
+
+    /**
+     * True from the moment a fresh article session starts until its first page
+     * finishes loading. Used to wipe the stale back/forward list (old articles
+     * and leftover "about:blank" entries) exactly once per session, so
+     * in-article navigation history is preserved afterwards.
+     */
+    private var freshLoad = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -58,7 +73,6 @@ class MainActivity : Activity() {
         statusTitle = findViewById(R.id.statusTitle)
         statusMessage = findViewById(R.id.statusMessage)
 
-        historyButton = findViewById(R.id.historyButton)
         articleOverlay = findViewById(R.id.articleOverlay)
         articleWebView = findViewById(R.id.articleWebView)
         articleUrlView = findViewById(R.id.articleUrl)
@@ -67,10 +81,9 @@ class MainActivity : Activity() {
         configureWebView()
         configureArticleWebView()
         findViewById<View>(R.id.articleClose).setOnClickListener { hideArticle() }
-        historyButton.setOnClickListener { showHistory() }
 
         // Starting Python and running the pipeline both block, so do it off
-        // the UI thread; onPipelineFinished() hops back via runOnUiThread().
+        // the UI thread; the completion path hops back via runOnUiThread().
         Thread(::runPipeline, "cosmos-pipeline").start()
     }
 
@@ -87,7 +100,9 @@ class MainActivity : Activity() {
             setSupportZoom(true)
         }
         // Article links must never leave the app: http(s) opens in the overlay
-        // below, while file:// (the report itself) loads in this view as usual.
+        // below, while file:// (the report itself and history.html) loads in
+        // this view as usual. Returning false here is what keeps the report's
+        // "Back issues" link in-view instead of bouncing it to the overlay.
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val scheme = request.url.scheme?.lowercase(Locale.US)
@@ -121,10 +136,33 @@ class MainActivity : Activity() {
                 return scheme != "http" && scheme != "https"
             }
 
-            override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
-                if (!url.isNullOrEmpty()) {
-                    articleUrlView.text = Uri.parse(url).host ?: url
+            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                // The document itself is never blocked, only its subresources,
+                // so ads/trackers vanish while the article still renders.
+                if (request.isForMainFrame) return null
+                val host = request.url.host
+                return if (isBlockedHost(host)) {
+                    WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                } else {
+                    null
                 }
+            }
+
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                updateArticleUrl(url)
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                // First completed page of a session: drop the stale
+                // back/forward list once, then leave in-article history alone.
+                if (freshLoad) {
+                    freshLoad = false
+                    articleWebView.clearHistory()
+                }
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                updateArticleUrl(url)
             }
         }
         articleWebView.webChromeClient = object : WebChromeClient() {
@@ -137,6 +175,7 @@ class MainActivity : Activity() {
 
     /** Show the article overlay and load one http(s) link into it. */
     private fun showArticle(url: String) {
+        freshLoad = true
         articleUrlView.text = Uri.parse(url).host ?: url
         articleProgress.progress = 0
         articleProgress.visibility = View.VISIBLE
@@ -144,74 +183,22 @@ class MainActivity : Activity() {
         articleWebView.loadUrl(url)
     }
 
-    /** Dismiss the overlay and release the loaded page. */
+    /** Dismiss the overlay, stop the current load, and blank the URL readout. */
     private fun hideArticle() {
-        articleOverlay.visibility = View.GONE
         articleWebView.stopLoading()
-        articleWebView.loadUrl("about:blank")
         articleUrlView.text = ""
+        articleProgress.progress = 0
+        articleProgress.visibility = View.GONE
+        articleOverlay.visibility = View.GONE
     }
 
-    /**
-     * List the issues already written to filesDir/reports/YYYY-MM-DD.html and
-     * load the chosen one into the report view. The report WebView shows any
-     * local file the same way, so opening yesterday's brief costs nothing.
-     */
-    private fun showHistory() {
-        val files = File(filesDir, "reports")
-            .listFiles { file -> file.isFile && file.name.endsWith(".html") }
-            ?.sortedWith(compareByDescending<File> { issueSortKey(it) }.thenByDescending { it.lastModified() })
-            .orEmpty()
-
-        if (files.isEmpty()) {
-            AlertDialog.Builder(this)
-                .setTitle(getString(R.string.history_title))
-                .setMessage(getString(R.string.history_empty))
-                .setPositiveButton(android.R.string.ok, null)
-                .show()
-            return
+    /** Reflect a navigation in the toolbar, but never show "about:blank". */
+    private fun updateArticleUrl(url: String?) {
+        if (url.isNullOrEmpty() || url == "about:blank") {
+            articleUrlView.text = ""
+        } else {
+            articleUrlView.text = Uri.parse(url).host ?: url
         }
-
-        val shown = files.take(HISTORY_LIMIT)
-        val labels = shown.map { describeIssue(it) }.toMutableList()
-        if (files.size > shown.size) {
-            // The tail is reported instead of silently dropped.
-            labels.add(getString(R.string.history_overflow, files.size - shown.size))
-        }
-        AlertDialog.Builder(this)
-            .setTitle(getString(R.string.history_title))
-            .setItems(labels.toTypedArray()) { _, which ->
-                if (which < shown.size) {
-                    webView.loadUrl("file://" + shown[which].absolutePath)
-                }
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
-    }
-
-    /** Sort key from a YYYY-MM-DD.html name; non-matching names sink to the end. */
-    private fun issueSortKey(file: File): Long {
-        val match = ISSUE_NAME.find(file.name) ?: return -1L
-        val (year, month, day) = match.destructured
-        return year.toLong() * 10000 + month.toLong() * 100 + day.toLong()
-    }
-
-    /** "Today" for the current issue, otherwise a readable date; the raw name as a fallback. */
-    private fun describeIssue(file: File): String {
-        val match = ISSUE_NAME.find(file.name) ?: return file.name
-        val (year, month, day) = match.destructured
-        val today = Calendar.getInstance()
-        val isToday = today.get(Calendar.YEAR) == year.toInt() &&
-            today.get(Calendar.MONTH) == month.toInt() - 1 &&
-            today.get(Calendar.DAY_OF_MONTH) == day.toInt()
-        if (isToday) {
-            return getString(R.string.history_today)
-        }
-        val date = Calendar.getInstance().apply {
-            clear()
-            set(year.toInt(), month.toInt() - 1, day.toInt())
-        }
-        return SimpleDateFormat("d MMMM yyyy", Locale.getDefault()).format(date.time)
     }
 
     @Suppress("DEPRECATION")
@@ -219,21 +206,48 @@ class MainActivity : Activity() {
         // Back closes the article first, then a page of it at a time, before
         // it is allowed to leave the report.
         if (articleOverlay.visibility == View.VISIBLE) {
-            if (articleWebView.canGoBack()) {
-                articleWebView.goBack()
-            } else {
-                hideArticle()
-            }
+            goArticleBack()
             return
         }
         super.onBackPressed()
     }
+
+    /**
+     * Step back one real page inside the overlay, skipping any "about:blank"
+     * entries, or dismiss the overlay when there is nowhere left to go.
+     */
+    private fun goArticleBack() {
+        val history = articleWebView.copyBackForwardList()
+        var target = history.currentIndex - 1
+        while (target >= 0 && isBlankEntry(history.getItemAtIndex(target))) {
+            target--
+        }
+        if (target >= 0) {
+            articleWebView.goBackOrForward(target - history.currentIndex)
+        } else {
+            hideArticle()
+        }
+    }
+
+    private fun isBlankEntry(item: WebHistoryItem): Boolean =
+        item.url == "about:blank" || item.originalUrl == "about:blank"
 
     private fun runPipeline() {
         // App-private storage: writable without any permission, and readable
         // back through file:// for the WebView. The CLI's --output default is
         // a relative "reports/" dir, so always pass the absolute path.
         val outputDir = File(filesDir, "reports")
+        val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        val todayReport = File(outputDir, "$today.html")
+
+        // Same-day caching: if today's brief is already on disk, skip Python
+        // and show it again. Fresh install (no file) falls through to a full run.
+        if (todayReport.isFile && todayReport.length() > 0L) {
+            writeHistoryIndex(outputDir)
+            runOnUiThread { displayNewestReport(outputDir) }
+            return
+        }
+
         val result = try {
             // Chaquopy must be told it is running on Android before any other
             // Python API is touched; without this it falls back to
@@ -249,29 +263,41 @@ class MainActivity : Activity() {
             // and friends, which extend Error and would otherwise kill the thread).
             "error:${t.javaClass.simpleName}:${t.message}"
         }
+
+        // Regenerate the back-issues index after every successful run, before
+        // the report (and its "Back issues" link) is shown.
+        if (result.startsWith("ok")) {
+            writeHistoryIndex(outputDir)
+        }
         runOnUiThread { onPipelineFinished(result, outputDir) }
     }
 
     private fun onPipelineFinished(result: String, outputDir: File) {
         if (result.startsWith("ok")) {
-            // Reports are named YYYY-MM-DD.html; newest by modification time
-            // also handles a leftover report from an earlier run today.
-            val newest = outputDir.listFiles { f -> f.isFile && f.name.endsWith(".html") }
-                ?.maxByOrNull { it.lastModified() }
-            if (newest != null) {
-                loadingPanel.visibility = View.GONE
-                reportRoot.visibility = View.VISIBLE
-                webView.loadUrl("file://" + newest.absolutePath)
-                return
-            }
-            showError(
-                getString(R.string.error_title),
-                getString(R.string.error_no_report) + "\n\n" + outputDir.absolutePath +
-                    "\n\nPipeline status: " + result
-            )
+            displayNewestReport(outputDir)
         } else {
             showError(getString(R.string.error_title), result)
         }
+    }
+
+    /**
+     * Load the newest *.html report into the report view. Reports are named
+     * YYYY-MM-DD.html; newest by modification time also handles a leftover
+     * report from an earlier run today.
+     */
+    private fun displayNewestReport(outputDir: File) {
+        val newest = outputDir.listFiles { f -> f.isFile && f.name.endsWith(".html") }
+            ?.maxByOrNull { it.lastModified() }
+        if (newest != null) {
+            loadingPanel.visibility = View.GONE
+            reportRoot.visibility = View.VISIBLE
+            webView.loadUrl("file://" + newest.absolutePath)
+            return
+        }
+        showError(
+            getString(R.string.error_title),
+            getString(R.string.error_no_report) + "\n\n" + outputDir.absolutePath
+        )
     }
 
     /** Error path: keep the panel visible, drop the spinner, explain what failed. */
@@ -281,11 +307,148 @@ class MainActivity : Activity() {
         statusMessage.text = message
     }
 
+    /**
+     * Write history.html into the reports dir: one link per saved issue, newest
+     * first. The report WebView loads file:// in-view, so both the report's
+     * "Back issues" footer link and these date links navigate without leaving
+     * the WebView.
+     */
+    private fun writeHistoryIndex(outputDir: File) {
+        val todayName = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date()) + ".html"
+        val issues = outputDir.listFiles { f ->
+            f.isFile && f.name.endsWith(".html") && f.name != HISTORY_FILE && ISSUE_NAME.matches(f.name)
+        }?.sortedWith(
+            compareByDescending<File> { issueSortKey(it) }.thenByDescending { it.lastModified() }
+        ).orEmpty()
+
+        val humanDate = SimpleDateFormat("EEEE, MMMM d, yyyy", Locale.getDefault())
+        val entries = StringBuilder()
+        for (file in issues) {
+            val match = ISSUE_NAME.matchEntire(file.name) ?: continue
+            val (year, month, day) = match.destructured
+            val date = Calendar.getInstance().apply {
+                clear()
+                set(year.toInt(), month.toInt() - 1, day.toInt())
+            }
+            val label = humanDate.format(date.time)
+            val prefix = if (file.name == todayName) "Today · " else ""
+            entries.append("""<li><a href="${file.name}">$prefix$label</a></li>""")
+        }
+
+        val html = """
+            <!doctype html><html><head><meta charset="utf-8"><title>Back issues</title><style>
+            body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#fff;max-width:900px;margin:40px auto;color:#172033;line-height:1.6;padding:0 16px}
+            h1{font-size:18px;margin:0 0 12px}.muted{color:#667085;font-size:12px}
+            ul{list-style:none;padding:0;margin:0}li{margin:0 0 16px;font-size:15px}
+            a{color:#174ea6;text-decoration:none}
+            </style></head><body>
+            <h1>Back issues</h1>
+            ${if (entries.isEmpty()) """<p class="muted">No saved issues yet.</p>""" else ""}
+            <ul>$entries</ul>
+            </body></html>
+        """.trimIndent()
+        File(outputDir, HISTORY_FILE).writeText(html)
+    }
+
+    /** Sort key from a YYYY-MM-DD.html name; non-matching names sink to the end. */
+    private fun issueSortKey(file: File): Long {
+        val match = ISSUE_NAME.matchEntire(file.name) ?: return -1L
+        val (year, month, day) = match.destructured
+        return year.toLong() * 10000 + month.toLong() * 100 + day.toLong()
+    }
+
     private companion object {
         /** Matches the pipeline's report filenames, e.g. 2026-09-15.html. */
         val ISSUE_NAME = Regex("""^(\d{4})-(\d{2})-(\d{2})\.html$""")
 
-        /** The dialog stays scannable: older issues are summarised, not listed. */
-        const val HISTORY_LIMIT = 60
+        /** The back-issues index lives alongside the reports it lists. */
+        const val HISTORY_FILE = "history.html"
+
+        /**
+         * High-confidence ad/tracker/analytic hosts blocked in the article
+         * overlay. Host-suffix matchable, so every subdomain is covered too.
+         * Immutable by construction (built once here, read from the WebView's
+         * non-UI intercept thread). Deliberately omits shared CDNs and
+         * ambiguous domains: when unsure, the domain is left out.
+         */
+        val BLOCKED_HOSTS: Set<String> = setOf(
+            // Google ads / analytics
+            "doubleclick.net",
+            "googlesyndication.com",
+            "googleadservices.com",
+            "adservice.google.com",
+            "google-analytics.com",
+            "googletagmanager.com",
+            "ads.youtube.com",
+            "adsystem.com",
+            "app-measurement.com",
+            // Meta / social pixels
+            "connect.facebook.net",
+            "graph.facebook.com",
+            "ads-twitter.com",
+            "analytics.twitter.com",
+            "static.ads-twitter.com",
+            "snap.licdn.com",
+            "px.ads.linkedin.com",
+            "ads.tiktok.com",
+            "analytics.tiktok.com",
+            // Ad exchanges / SSPs
+            "adnxs.com",
+            "criteo.com",
+            "casalemedia.com",
+            "pubmatic.com",
+            "rubiconproject.com",
+            "openx.net",
+            "indexww.com",
+            "sharethrough.com",
+            "smartadserver.com",
+            "teads.tv",
+            "3lift.com",
+            "bidswitch.net",
+            "sovrn.com",
+            "undertone.com",
+            "adform.net",
+            "adroll.com",
+            "everesttech.net",
+            "yieldmo.com",
+            "amazon-adsystem.com",
+            "media.net",
+            // Content recommendation widgets
+            "taboola.com",
+            "outbrain.com",
+            "revcontent.com",
+            "zergnet.com",
+            "mgid.com",
+            "diginext.website",
+            "sphinn.com",
+            // Measurement / ad verification
+            "scorecardresearch.com",
+            "quantserve.com",
+            "quantcount.com",
+            "moatads.com",
+            "doubleverify.com",
+            "adsafeprotected.com",
+            "chartbeat.com",
+            "chartbeat.net",
+            "bidr.io",
+            "adsymptotic.com",
+            "krxd.net",
+        )
+
+        /**
+         * True when [host] is, or sits under, a blocked domain. Walks the
+         * dot-labels right-to-left, so a typical host resolves in a couple of
+         * set lookups with no regex or full-host precomputation needed.
+         */
+        fun isBlockedHost(host: String?): Boolean {
+            if (host.isNullOrBlank()) return false
+            var candidate = host.lowercase(Locale.US)
+            while (true) {
+                if (candidate in BLOCKED_HOSTS) return true
+                val dot = candidate.indexOf('.')
+                if (dot < 0) return false
+                candidate = candidate.substring(dot + 1)
+            }
+        }
     }
 }

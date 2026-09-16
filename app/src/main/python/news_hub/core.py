@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 from . import __version__
 from . import geometry
@@ -717,6 +717,19 @@ def _iso(point: Sequence[float]) -> tuple[float, float]:
     return (x - y) * _ISO_X, (x + y) * _ISO_Y - z
 
 
+def _rotate_iso(point: Sequence[float]) -> tuple[float, float]:
+    """Isometric projection followed by the 90° screen rotation about the origin.
+
+    The rotation ``(x, y) -> (-y, x)`` in projection space corresponds to the
+    screen transform ``(x, y) -> (y, -x)`` in SVG coordinates (where y grows
+    downward). It sends the corroboration axis from "up" to "left" and the
+    age/authority pair to the mirrored ±120° directions, so the whole map scene
+    turns rigidly together without changing any relative geometry.
+    """
+    x, y = _iso(point)
+    return -y, x
+
+
 #: Single-letter prefixes for the map labels, so a marker points at a section entry.
 CATEGORY_LETTERS: dict[str, str] = {"Technology": "T", "Geopolitics": "G", "Economics": "E"}
 
@@ -758,15 +771,21 @@ def _surface_points(
     return points
 
 
-def _map_frame(points: Sequence[Sequence[float]], padding: float = 0.22) -> tuple[float, float, float, float]:
+def _map_frame(
+    points: Sequence[Sequence[float]],
+    padding: float = 0.22,
+    project: Callable[[Sequence[float]], tuple[float, float]] = _iso,
+) -> tuple[float, float, float, float]:
     """Square, isometric bounding box of the plotted points that keeps the origin in view.
 
     Framing on the data rather than the whole unit cube is what makes the map
     readable: stories cluster near the origin, so a view sized to the full cube
     would spend nearly all of its area on empty space. The frame is kept square
-    so the isometric projection stays undistorted.
+    so the isometric projection stays undistorted. ``project`` is the projection
+    applied to each point before framing, so the SVG map can frame on the
+    rotated projection while the ASCII map frames on the plain one.
     """
-    projected = [_iso(point) for point in points]
+    projected = [project(point) for point in points]
     projected.append((0.0, 0.0))  # the ideal origin, always in frame
     xs = [point[0] for point in projected]
     ys = [point[1] for point in projected]
@@ -775,97 +794,44 @@ def _map_frame(points: Sequence[Sequence[float]], padding: float = 0.22) -> tupl
     return (center_x - span / 2.0, center_y - span / 2.0, span, span)
 
 
-def _ray_to_frame(direction: tuple[float, float], frame: tuple[float, float, float, float]) -> tuple[float, float]:
-    """Clip a ray leaving the origin to the frame, so axis lines never run off it."""
-    low_x, low_y, span_x, span_y = frame
-    high_x, high_y = low_x + span_x, low_y + span_y
-    factors = []
-    for component, low, high in ((direction[0], low_x, high_x), (direction[1], low_y, low_y + span_y)):
-        if abs(component) > 1e-12:
-            factors.append(((high if component > 0 else low)) / component)
-    factor = min(factors) if factors else 0.0
-    return direction[0] * factor, direction[1] * factor
-
-
-#: Nested iso-contours drawn around the origin, as fractions of the selection
-#: surface's outline radius. They suggest the curvature of the manifold the
-#: ranking ball lives on; the outermost ring sits just inside the real surface.
-MANIFOLD_RINGS: tuple[float, ...] = (0.24, 0.46, 0.67, 0.85)
-
-
-def _angular_outline(
-    points_xy: Sequence[tuple[float, float]],
+def _axis_reach(
     origin: tuple[float, float],
-    bins: int = 72,
-) -> list[tuple[float, float]]:
-    """Radial outline ``(angle, radius)`` of a projected region about ``origin``.
-
-    The trust surface is radial in the cube and the isometric projection is
-    linear, so its projection stays star-shaped about the projected origin:
-    the farthest projected point per angular bin is the visible outline.
-    Bins left empty by sparse sampling are filled by circular interpolation
-    between their nearest filled neighbours, so the contour closes smoothly.
-    """
-    ox, oy = origin
-    radii = [0.0] * bins
-    seen = [False] * bins
-    for x, y in points_xy:
-        radius = math.hypot(x - ox, y - oy)
-        if radius <= 1e-9:
-            continue
-        index = int((math.atan2(y - oy, x - ox) % (2.0 * math.pi)) / (2.0 * math.pi) * bins) % bins
-        if radius > radii[index]:
-            radii[index] = radius
-            seen[index] = True
-    if not any(seen):
-        return []
-    filled = [index for index, mark in enumerate(seen) if mark]
-    if len(filled) == 1:
-        return [(2.0 * math.pi * index / bins, radii[filled[0]]) for index in range(bins)]
-    for index in range(bins):
-        if seen[index]:
-            continue
-        following = next((f for f in filled if f > index), filled[0] + bins)
-        preceding = max((f for f in filled if f < index), default=filled[-1] - bins)
-        weight = (index - preceding) / (following - preceding)
-        radii[index] = radii[preceding % bins] * (1.0 - weight) + radii[following % bins] * weight
-    return [(2.0 * math.pi * index / bins, radii[index]) for index in range(bins)]
+    ux: float,
+    uy: float,
+    width: float,
+    height: float,
+    pad: float,
+) -> float:
+    """How far a ray from ``origin`` along the screen unit ``(ux, uy)`` stays in view."""
+    reach = float("inf")
+    if abs(ux) > 1e-12:
+        edge_x = width - pad if ux > 0 else pad
+        reach = min(reach, (edge_x - origin[0]) / ux)
+    if abs(uy) > 1e-12:
+        edge_y = height - pad if uy > 0 else pad
+        reach = min(reach, (edge_y - origin[1]) / uy)
+    return max(0.0, reach)
 
 
-def _contour_path(
-    outline: Sequence[tuple[float, float]],
-    origin: tuple[float, float],
-    scale: float = 1.0,
-    wobble: float = 0.0,
-    phase: float = 0.0,
-) -> str:
-    """A closed, smooth SVG path following ``outline`` (scaled, optionally wobbled).
+#: Screen-space unit directions (SVG y grows downward) of the drawn graph
+#: axes, in :data:`geometry.TRUST_AXES` order, after the 90° screen rotation
+#: that sends corroboration from "up" to "left": age up-right, authority
+#: down-right, corroboration left, still at exact 120° separations. These
+#: describe the frame only — data positions come from :func:`_rotate_iso`.
+AXIS_DIRECTIONS: tuple[tuple[float, float], ...] = (
+    (_ISO_Y, -_ISO_X),
+    (_ISO_Y, _ISO_X),
+    (-1.0, 0.0),
+)
 
-    Samples are joined with cubic beziers (a closed Catmull-Rom spline), which
-    turns the sampled radial function into a smooth iso-contour. ``wobble``
-    adds a mild deterministic angular perturbation -- two low harmonics -- so
-    the drawn rings read as an irregular curved manifold rather than concentric
-    circles. Deterministic by construction, so the map is reproducible.
-    """
-    count = len(outline)
-    if count < 3:
-        return ""
-    ox, oy = origin
-    samples: list[tuple[float, float]] = []
-    for angle, radius in outline:
-        reach = radius * scale * (
-            1.0 + wobble * (0.6 * math.sin(3.0 * angle + phase) + 0.4 * math.sin(5.0 * angle + 1.7 * phase))
-        )
-        samples.append((ox + reach * math.cos(angle), oy + reach * math.sin(angle)))
-    parts = [f"M {samples[0][0]:.1f} {samples[0][1]:.1f}"]
-    for index in range(count):
-        p0, p1 = samples[index - 1], samples[index]
-        p2, p3 = samples[(index + 1) % count], samples[(index + 2) % count]
-        c1x, c1y = p1[0] + (p2[0] - p0[0]) / 6.0, p1[1] + (p2[1] - p0[1]) / 6.0
-        c2x, c2y = p2[0] - (p3[0] - p1[0]) / 6.0, p2[1] - (p3[1] - p1[1]) / 6.0
-        parts.append(f"C {c1x:.1f} {c1y:.1f} {c2x:.1f} {c2y:.1f} {p2[0]:.1f} {p2[1]:.1f}")
-    parts.append("Z")
-    return " ".join(parts)
+#: Axis length as a share of the frame span, and tick positions along it.
+AXIS_LENGTH_FRACTION = 0.42
+AXIS_TICKS: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8)
+#: How far the arrowhead and its label extend past the axis line, in px. The
+#: axis is shortened by this much so the label anchor stays on the padded canvas
+#: no matter which way the rotated frame points.
+AXIS_ARROW_EXTENT = 8.0
+AXIS_LABEL_GAP = 11.0
 
 
 def render_ascii_map(
@@ -986,6 +952,7 @@ def _map_frame_and_context(
     star: float,
     metric: geometry.Metric | None = None,
     samples: int = 260,
+    project: Callable[[Sequence[float]], tuple[float, float]] = _iso,
 ) -> tuple[tuple[float, float, float, float], list[tuple[float, float, float]], list[Story]]:
     """Frame the map on the selection, keeping only the context that fits inside it.
 
@@ -996,8 +963,8 @@ def _map_frame_and_context(
     collected".
     """
     surface = _surface_points(star, metric, samples=samples)
-    frame = _map_frame([story.trust for story in stories] + surface)
-    visible = [story for story in rejected if _inside_frame(_iso(story.trust), frame)]
+    frame = _map_frame([story.trust for story in stories] + surface, project=project)
+    visible = [story for story in rejected if _inside_frame(project(story.trust), frame)]
     return frame, surface, visible
 
 
@@ -1012,13 +979,17 @@ def _render_map_svg(
 ) -> str:
     """Inline SVG of the same cube the text map draws, with in-frame context leads.
 
-    The map is drawn as a smooth high-dimensional manifold projection rather
-    than graph paper: a very soft radial backdrop suggests the potential
-    surface dipping toward the origin, nested iso-contours ring it, and the
-    selection surface itself is one closed contour. Data points, axis rays,
-    labels and markers keep their positions and colors.
+    Drawn as a light isometric graph rather than a filled shape: every selected
+    story carries a thin vector from the projected origin — where the three axes
+    meet — to its dot, so each vector's length and direction read as that item's
+    deficit magnitude and direction. The frame around them is a real three-axis
+    system — arrowheads, ticks and the actual axis names — with corroboration
+    pointing left and the other two at ±120° from it, over a faint dashed floor
+    grid. Nothing here is filled dark and no backdrop is painted, so the report's
+    own paper tone shows through. Data points, labels and markers keep their
+    positions and colors exactly.
     """
-    frame, surface, visible = _map_frame_and_context(stories, rejected, star, metric)
+    frame, _, visible = _map_frame_and_context(stories, rejected, star, metric, project=_rotate_iso)
     low_x, low_y, span_x, span_y = frame
     pad = 26.0
     scale = min((width - 2 * pad) / span_x, (height - 2 * pad) / span_y)
@@ -1026,62 +997,119 @@ def _render_map_svg(
     offset_y = (height - span_y * scale) / 2.0
 
     def to_screen(point: Sequence[float]) -> tuple[float, float]:
-        x, y = _iso(point)
+        x, y = _rotate_iso(point)
         sx = offset_x + (x - low_x) * scale
         sy = offset_y + (1.0 - (y - low_y) / span_y) * span_y * scale
         return sx, sy
 
     origin = to_screen((0.0, 0.0, 0.0))
-    parts: list[str] = []
 
-    # Soft radial gradient backdrop: a faint pool of light at the origin that
-    # fades over the whole frame, suggesting the potential surface.
-    reach = max(math.hypot(cx - origin[0], cy - origin[1]) for cx, cy in
-                ((0.0, 0.0), (width, 0.0), (0.0, height), (width, height)))
-    parts.append(
-        f'<defs><radialGradient id="manifoldFade" gradientUnits="userSpaceOnUse" '
-        f'cx="{origin[0]:.1f}" cy="{origin[1]:.1f}" r="{reach:.1f}">'
-        '<stop offset="0" stop-color="#c9d6ea" stop-opacity=".45"/>'
-        '<stop offset="1" stop-color="#c9d6ea" stop-opacity="0"/></radialGradient></defs>'
-    )
-    parts.append(f'<rect x="0" y="0" width="{width}" height="{height}" fill="url(#manifoldFade)"/>')
-
-    # The manifold: the selection surface as one smooth closed contour, plus
-    # nested, mildly perturbed iso-contours ringing the origin. Strokes thin
-    # out and fade toward the rim, like level sets of a curved surface.
-    outline = _angular_outline([to_screen(point) for point in surface], origin)
-    if outline:
-        parts.append(f'<path class="surface" d="{_contour_path(outline, origin)}"/>')
-        for index, fraction in enumerate(MANIFOLD_RINGS):
-            depth = index / max(1, len(MANIFOLD_RINGS) - 1)
-            parts.append(
-                f'<path class="manifold" stroke-opacity="{0.42 * (1.0 - 0.68 * depth):.2f}" '
-                f'stroke-width="{1.1 - 0.55 * depth:.2f}" '
-                f'd="{_contour_path(outline, origin, scale=fraction, wobble=0.05, phase=1.3 + 2.4 * index)}"/>'
-            )
-
-    parts.append('<g class="cloud">')
-    for story in visible[:400]:
-        sx, sy = to_screen(story.trust)
-        parts.append(f'<circle cx="{sx:.1f}" cy="{sy:.1f}" r="1.6"/>')
-    parts.append("</g>")
-
-    parts.append('<g class="axes">')
-    for label, direction in AXIS_RAYS:
-        end = _ray_to_frame(_iso(direction), frame)
-        ex, ey = origin[0] + end[0] * scale, origin[1] - end[1] * scale
-        parts.append(f'<line x1="{origin[0]:.1f}" y1="{origin[1]:.1f}" x2="{ex:.1f}" y2="{ey:.1f}"/>')
-        parts.append(
-            f'<text class="axlabel" x="{origin[0] + end[0] * scale * 0.94:.1f}" '
-            f'y="{origin[1] - end[1] * scale * 0.94:.1f}">{_esc(label)}</text>'
+    # The 3-D graph frame: three axes from the projected origin with
+    # corroboration pointing left and age/authority at ±120° from it (up-right
+    # and down-right), each long enough to read as a graph axis yet clipped so
+    # arrowhead and label stay on canvas.
+    span_screen = span_x * scale
+    axis_geometry = [
+        (
+            name,
+            ux,
+            uy,
+            min(
+                AXIS_LENGTH_FRACTION * span_screen,
+                max(0.0, _axis_reach(origin, ux, uy, width, height, pad) - AXIS_ARROW_EXTENT - AXIS_LABEL_GAP),
+            ),
         )
-    parts.append("</g>")
+        for name, (ux, uy) in zip(geometry.TRUST_AXES, AXIS_DIRECTIONS)
+    ]
 
+    # Floor grid: the x-y plane of that frame, dashed and barely visible, drawn
+    # first so it sits behind the data. Its near edges are the two axes.
+    floor: list[str] = []
+    _, x_ux, x_uy, x_len = axis_geometry[0]
+    _, y_ux, y_uy, y_len = axis_geometry[1]
+    x_vector = (x_ux * x_len, x_uy * x_len)
+    y_vector = (y_ux * y_len, y_uy * y_len)
+
+    def floor_line(start: tuple[float, float], end: tuple[float, float]) -> None:
+        floor.append(
+            f'<line x1="{start[0]:.1f}" y1="{start[1]:.1f}" x2="{end[0]:.1f}" y2="{end[1]:.1f}"/>'
+        )
+
+    for fraction in (1.0 / 3.0, 2.0 / 3.0, 1.0):
+        along_x = (origin[0] + fraction * x_vector[0], origin[1] + fraction * x_vector[1])
+        floor_line(along_x, (along_x[0] + y_vector[0], along_x[1] + y_vector[1]))
+        along_y = (origin[0] + fraction * y_vector[0], origin[1] + fraction * y_vector[1])
+        floor_line(along_y, (along_y[0] + x_vector[0], along_y[1] + x_vector[1]))
+
+    axes: list[str] = []
+    for name, ux, uy, length in axis_geometry:
+        base_x, base_y = origin[0] + ux * length, origin[1] + uy * length
+        tip_x, tip_y = origin[0] + ux * (length + AXIS_ARROW_EXTENT), origin[1] + uy * (length + AXIS_ARROW_EXTENT)
+        normal_x, normal_y = -uy, ux
+        axes.append(
+            f'<line class="axis" x1="{origin[0]:.1f}" y1="{origin[1]:.1f}" '
+            f'x2="{base_x:.1f}" y2="{base_y:.1f}"/>'
+        )
+        for fraction in AXIS_TICKS:
+            tick_x, tick_y = origin[0] + ux * length * fraction, origin[1] + uy * length * fraction
+            axes.append(
+                f'<line class="axis-tick" stroke-width="0.8" stroke-opacity="0.7" '
+                f'x1="{tick_x - 3.0 * normal_x:.1f}" y1="{tick_y - 3.0 * normal_y:.1f}" '
+                f'x2="{tick_x + 3.0 * normal_x:.1f}" y2="{tick_y + 3.0 * normal_y:.1f}"/>'
+            )
+        axes.append(
+            f'<path class="axis-arrow" fill="#667085" stroke="none" '
+            f'd="M {tip_x:.1f} {tip_y:.1f} L {base_x + 3.0 * normal_x:.1f} {base_y + 3.0 * normal_y:.1f} '
+            f'L {base_x - 3.0 * normal_x:.1f} {base_y - 3.0 * normal_y:.1f} Z"/>'
+        )
+        axes.append(
+            f'<text class="axlabel" x="{tip_x + AXIS_LABEL_GAP * ux:.1f}" y="{tip_y + AXIS_LABEL_GAP * uy:.1f}" '
+            f'text-anchor="middle" font-size="10" fill="#667085">{_esc(name)}</text>'
+        )
+
+    parts: list[str] = []
+    parts.append(
+        '<g class="floor" stroke="#b6c2d4" stroke-width="0.6" stroke-dasharray="3 4" '
+        f'stroke-opacity="0.55" fill="none">{"".join(floor)}</g>'
+    )
+
+    # Each selected story gets a thin vector from the projected origin to its
+    # dot, so the set of vectors reads as spokes of the graph: a vector's
+    # length and direction are that item's deficit magnitude and direction.
+    # The dots themselves are nudged apart for legibility, so each vector ends
+    # on the same nudged centre as the dot it belongs to, and the whole group
+    # is painted beneath the data (right after the floor grid).
+    positions = []
     for index, story in enumerate(stories):
         sx, sy = to_screen(story.trust)
         # Deterministic nudge so items that agree on all three trust axes stay visible.
         sx += 5.0 * math.cos(index * 2.399)
         sy += 5.0 * math.sin(index * 2.399)
+        positions.append((sx, sy))
+    vectors = [
+        f'<line class="vector" x1="{origin[0]:.1f}" y1="{origin[1]:.1f}" x2="{sx:.1f}" y2="{sy:.1f}"/>'
+        for sx, sy in positions
+    ]
+    parts.append(
+        '<g class="vectors" stroke="#8fa2bc" stroke-width="0.6" stroke-opacity="0.45" '
+        f'fill="none">{"".join(vectors)}</g>'
+    )
+
+    parts.append('<g class="cloud">')
+    for story in visible[:400]:
+        sx, sy = to_screen(story.trust)
+        parts.append(
+            f'<circle cx="{sx:.1f}" cy="{sy:.1f}" r="1.6" fill="#b9c2d0" fill-opacity="0.45"/>'
+        )
+    parts.append("</g>")
+
+    parts.append(
+        '<g class="axes" stroke="#667085" stroke-width="1" stroke-opacity="0.85" fill="none">'
+        f'{"".join(axes)}</g>'
+    )
+
+    for index, story in enumerate(stories):
+        sx, sy = positions[index]
         size = max(3.0, 11.0 * (1.0 - min(1.0, story.trust_radius)))
         color = CATEGORY_COLORS.get(story.category, "#475467")
         parts.append(
@@ -1091,7 +1119,8 @@ def _render_map_svg(
         )
         marker = (labels or {}).get(id(story), str(index))
         parts.append(
-            f'<text class="marker" x="{sx + size + 1.5:.1f}" y="{sy + 3.5:.1f}">{_esc(marker)}</text>'
+            f'<text class="marker" x="{sx + size + 1.5:.1f}" y="{sy + 3.5:.1f}" '
+            f'font-size="10" fill="#334155">{_esc(marker)}</text>'
         )
 
     return (
@@ -1111,7 +1140,7 @@ def _render_map_section(
     """The map plus an honest caption about what its frame actually shows."""
     if not stories:
         return '<p>Nothing met the selection bar, so there is no map to draw.</p>'
-    _, _, visible = _map_frame_and_context(stories, rejected, star, metric)
+    _, _, visible = _map_frame_and_context(stories, rejected, star, metric, project=_rotate_iso)
     hidden = len(rejected) - len(visible)
     note = (
         f" The frame is fitted to the selection, so {hidden} of {len(rejected)} rejected leads sit outside it."
@@ -1119,11 +1148,14 @@ def _render_map_section(
         else ""
     )
     return (
-        '<p class="story-meta">Every item is plotted at its (age, authority, corroboration) deficits, projected '
-        f'isometrically. The smooth closed contour is the selection surface |d|_W = {star:.3f} and the nested rings '
-        'trace the manifold\'s falloff around the strongest evidence, so closer is stronger. Grey dots are rejected '
-        'leads, and each marker is the topic-section label of a '
-        f"chosen item (T = technology, G = geopolitics, E = economics).{note}</p>"
+        '<p class="story-meta">Every item is plotted at its (age, authority, corroboration) deficits in an '
+        'isometric view of the trust cube. Each thin line runs from the projected origin — where the three '
+        'axes meet — to a chosen item\'s dot, so a line\'s length and direction are that story\'s deficit '
+        'magnitude and direction: shorter is stronger. The frame is fitted to the selection surface '
+        f'|d|_W = {star:.3f}, and the axis frame marks the age, authority and corroboration axes with '
+        'arrowheads, ticks and a dashed floor grid. Grey dots are rejected leads, and each marker is the '
+        'topic-section label of a chosen item (T = technology, G = geopolitics, E = economics).'
+        f"{note}</p>"
         + _render_map_svg(stories, star, rejected, labels, metric)
     )
 
@@ -1323,14 +1355,10 @@ table{{border-collapse:collapse;width:100%;font-size:12px;margin:10px 0}}
 th,td{{border:1px solid #dfe5ee;padding:6px 8px;text-align:left;vertical-align:top}}
 .scroller{{overflow-x:auto}}
 th{{background:#f6f8fb}}details.stats summary{{cursor:pointer;color:#174ea6;font-size:13px}}
-svg.map{{width:100%;height:auto;border:1px solid #dfe5ee;background:#fbfcfe;border-radius:6px}}
-svg.map .axes line{{stroke:#b6c2d4;stroke-width:1;stroke-dasharray:4 4}}
-svg.map .surface path{{fill:#7c8ba1;fill-opacity:.10;stroke:#7c8ba1;stroke-width:1.2;stroke-opacity:.7}}
-svg.map .manifold path{{fill:none;stroke:#8fa2bc}}
-svg.map .cloud circle{{fill:#b9c2d0;fill-opacity:.45}}
-svg.map .axlabel{{font-size:10px;fill:#667085}}svg.map .marker{{font-size:10px;fill:#334155}}
+svg.map{{width:100%;height:auto;border:1px solid #dfe5ee;border-radius:6px}}
 .ladder{{font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre;overflow-x:auto}}
 footer{{margin-top:38px;color:#667085;font-size:12px}}
+.back-issues{{margin-top:12px;font-size:12px;color:#667085}}.back-issues a{{color:#667085}}
 </style></head><body>
 <h1>Cosmos</h1>
 <p class="subtitle">Generated {generated.strftime("%Y-%m-%d %H:%M UTC")} · ranked leads, preserved evidence, no invented reporting</p>
@@ -1349,6 +1377,7 @@ not because it won a leaderboard.</div>
 {''.join(sections)}
 {f'<section><h2>Collection notes</h2><ul>{error_block}</ul>{stats_block}</section>' if errors or stats else ''}
 <footer>Personal research brief. Source quality is a ranking aid, not a guarantee. Verify consequential claims with primary documents.</footer>
+<p class="back-issues"><a href="history.html">Back issues</a></p>
 </body></html>'''
 
 
