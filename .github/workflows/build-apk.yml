@@ -5,6 +5,11 @@ on:
   push:
     branches: [ main, master ]
 
+# Publishing the update release needs write access to repository contents; the
+# default token is read-only under some repository settings, so be explicit.
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -37,6 +42,10 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
 
       - name: Build debug APK
+        env:
+          # Stamped into the APK as its versionCode (see app/build.gradle); the
+          # run number only ever grows, so each build installs over the last.
+          COSMOS_VERSION_CODE: ${{ github.run_number }}
         run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK artifact
@@ -45,3 +54,23 @@ jobs:
           name: cosmos-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      # The app's update channel. Actions artifacts cannot serve it: their zip
+      # endpoint answers "401 Requires authentication" to an unauthenticated
+      # client even for a public repo (verified with curl), and they expire
+      # after 90 days. Release assets download anonymously and for good, so the
+      # updater points at the newest release instead.
+      - name: Publish the update release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: build-${{ github.run_number }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk cosmos-debug.apk
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "Cosmos 1.7 (build ${{ github.run_number }})" \
+              --notes "Debug-signed APK for the Cosmos in-app updater. The number in the tag is the APK's versionCode."
+          fi
+          gh release upload "$TAG" cosmos-debug.apk --clobber
+          echo "Update channel now serves $TAG" >> "$GITHUB_STEP_SUMMARY"

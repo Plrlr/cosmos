@@ -16,44 +16,50 @@
         android:orientation="vertical"
         android:visibility="gone">
 
-        <LinearLayout
-            android:id="@+id/updateBanner"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:background="#F4F7FD"
-            android:paddingStart="16dp"
-            android:paddingEnd="8dp"
-            android:paddingTop="10dp"
-            android:paddingBottom="10dp"
-            android:visibility="gone">
-
-            <TextView
-                android:id="@+id/updateBannerText"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:textSize="13sp"
-                android:textColor="#174EA6"
-                android:clickable="true"
-                android:focusable="true" />
-
-            <TextView
-                android:id="@+id/updateSkip"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:padding="8dp"
-                android:text="@string/update_skip"
-                android:textSize="14sp"
-                android:textColor="#667085" />
-        </LinearLayout>
-
         <WebView
             android:id="@+id/webView"
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1" />
+    </LinearLayout>
+
+    <!-- The update banner sits at the root, not inside reportRoot, so it is
+         still reachable while the loading panel is up: a brief that failed to
+         generate is exactly when an update is worth offering. It is declared
+         before the chat and article overlays, so it can never cover their
+         toolbars, and the loading panel draws over it transparently. -->
+    <LinearLayout
+        android:id="@+id/updateBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="#F4F7FD"
+        android:paddingStart="16dp"
+        android:paddingEnd="8dp"
+        android:paddingTop="10dp"
+        android:paddingBottom="10dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/updateBannerText"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:textSize="13sp"
+            android:textColor="#174EA6"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <TextView
+            android:id="@+id/updateSkip"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="8dp"
+            android:text="@string/update_skip"
+            android:textSize="14sp"
+            android:textColor="#667085" />
     </LinearLayout>
 
     <!-- Full-screen GLM chat ("Search"), opened from the history page's

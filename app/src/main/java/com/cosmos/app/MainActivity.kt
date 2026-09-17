@@ -31,19 +31,21 @@ import com.chaquo.python.android.AndroidPlatform
 import android.content.ContentProvider
 import android.content.ContentValues
 import android.content.Intent
+import android.content.pm.PackageInfo
 import android.database.Cursor
-import android.net.ParseException
+import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.provider.Settings
 import android.widget.Toast
 import java.io.ByteArrayInputStream
 import java.io.File
-import java.io.FileOutputStream
-import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import java.text.ParseException
 import java.text.SimpleDateFormat
+import java.util.zip.ZipFile
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
@@ -52,16 +54,21 @@ import kotlin.math.roundToInt
 import org.json.JSONArray
 import org.json.JSONObject
 
-private const val UPDATE_ARTIFACTS_URL = "https://api.github.com/repos/Plrlr/cosmos/actions/artifacts?per_page=5"
-private const val UPDATE_BASE_URL = "https://api.github.com/repos/Plrlr/cosmos/actions"
-private const val UPDATE_ARTIFACTS_PATH = "artifacts"
-private const val UPDATE_ARTIFACT_NAME = "cosmos-debug-apk"
+// The update channel is the repo's GitHub *releases*, not its Actions
+// artifacts: the artifact zip endpoint answers "401 Requires authentication"
+// even for a public repo, so an untokened app can list artifacts but can never
+// download one. Release assets are anonymous, permanent (artifacts expire) and
+// are the supported way to publish a sideloaded APK. The CI publishes one
+// release per push, tagged "build-<versionCode>".
+private const val UPDATE_RELEASES_URL =
+    "https://api.github.com/repos/Plrlr/cosmos/releases?per_page=10"
+private const val UPDATE_APK_ASSET = "cosmos-debug.apk"
 private const val UPDATE_AUTHORITY = "com.cosmos.app.update"
-private const val UPDATE_ZIP_NAME = "cosmos-update.zip"
 private const val UPDATE_APK_DIR = "update"
 private const val UPDATE_APK_PATH = "update/app-debug.apk"
+private const val APK_MIME_TYPE = "application/vnd.android.package-archive"
 private const val PREF_LAST_CHECK_MS = "last_update_check_ms"
-private const val PREF_SKIPPED_ARTIFACT = "skipped_artifact_id"
+private const val PREF_SKIPPED_TAG = "skipped_update_tag"
 private const val UPDATE_CHECK_INTERVAL_MS = 60_000L  // one check per launch; 1-minute guard
 private const val CHAT_CODE_RATE_LIMIT = 1302
 private const val CHAT_CODE_OVERLOAD = 1305
@@ -114,6 +121,13 @@ class MainActivity : Activity() {
     private lateinit var updateBannerText: TextView
     private lateinit var updateSkip: TextView
 
+    /** Download URL and release tag of the update currently on offer. */
+    private var updateApkUrl: String? = null
+    private var updateTag: String = ""
+
+    /** Validated APK waiting for the user to allow installs, then retried. */
+    private var pendingInstallApk: File? = null
+
     /** The session's conversation turns, in order: "user" and "assistant". */
     private val chatHistory = ArrayList<ChatTurn>()
 
@@ -163,9 +177,10 @@ class MainActivity : Activity() {
         findViewById<View>(R.id.chatKey).setOnClickListener { showKeyDialog(showHint = false) }
         updateBannerText.setOnClickListener { startUpdateDownload() }
         updateSkip.setOnClickListener {
-            val skippedId = updateArtifactId?.toString() ?: ""
+            // Remember this release so the banner stays away until a newer
+            // build is published.
             getSharedPreferences(CHAT_PREFS_NAME, MODE_PRIVATE).edit()
-                .putString(PREF_SKIPPED_ARTIFACT, skippedId).apply()
+                .putString(PREF_SKIPPED_TAG, updateTag).apply()
             updateBanner.visibility = View.GONE
         }
         chatSend.setOnClickListener { sendChatMessage() }
@@ -178,6 +193,23 @@ class MainActivity : Activity() {
         // the UI thread; the completion path hops back via runOnUiThread().
         Thread(::runPipeline, "cosmos-pipeline").start()
         Thread({ checkForUpdate() }, "cosmos-update-check").start()
+    }
+
+    /**
+     * Continue an install that was waiting on the user allowing "install
+     * unknown apps". Runs on every resume, but the pending APK is cleared the
+     * first time through, so granting the permission much later never fires a
+     * surprise installer over whatever the user is doing.
+     */
+    override fun onResume() {
+        super.onResume()
+        val apk = pendingInstallApk ?: return
+        pendingInstallApk = null
+        if (canInstallPackages()) {
+            launchInstaller(apk)
+        } else {
+            failUpdate(getString(R.string.update_install_failed))
+        }
     }
 
     private fun configureWebView() {
@@ -899,8 +931,9 @@ class MainActivity : Activity() {
 
 
     // ------------------------------------------------------------------
-    // Auto-update: check GitHub Actions artifacts (public repo, token-free),
-    // banner when a new build exists, download + offer install.
+    // Auto-update: check the repo's GitHub releases (public, token-free),
+    // banner when a newer build exists, download the APK, hand it to the
+    // system installer. See UPDATE_RELEASES_URL for why not artifacts.
     // ------------------------------------------------------------------
 
     private fun checkForUpdate() {
@@ -910,126 +943,283 @@ class MainActivity : Activity() {
         if (now - last < UPDATE_CHECK_INTERVAL_MS) return
         prefs.edit().putLong(PREF_LAST_CHECK_MS, now).apply()
         try {
-            val conn = urlConnection(UPDATE_ARTIFACTS_URL)
-            val body = conn.inputStream.use { it.readBytes() }.toString(Charsets.UTF_8)
-            conn.disconnect()
-            // GitHub wraps the list: {"total_count": N, "artifacts": [...]}
-            val arr = JSONObject(body).getJSONArray("artifacts")
-            var newest: org.json.JSONObject? = null
-            for (i in 0 until arr.length()) {
-                val a = arr.getJSONObject(i)
-                if (a.optString("name") == UPDATE_ARTIFACT_NAME && !a.optBoolean("expired", false)) {
-                    val cur = newest
-                    if (cur == null || a.optLong("id", 0) > cur.optLong("id", 0)) newest = a
-                }
+            val listBody = httpGetBody(UPDATE_RELEASES_URL) ?: return
+            val release = newestReleaseWithApk(JSONArray(listBody)) ?: return
+            val tag = release.optString("tag_name")
+            if (tag.isNotEmpty() && tag == prefs.getString(PREF_SKIPPED_TAG, null)) return
+
+            // The release tag carries the build's own versionCode
+            // ("build-21"), so a newer build is recognised by comparing
+            // numbers rather than device and server clocks. A release tagged
+            // some other way falls back to "published after this copy was
+            // last updated". Either way, a build already installed never
+            // re-offers itself forever after (firstInstallTime never moves).
+            val remoteCode = buildNumberFromTag(tag)
+            val isNewer = if (remoteCode > 0) {
+                remoteCode > installedVersionCode()
+            } else {
+                publishedAfterLastUpdate(release)
             }
-            val artifact = newest ?: return
-            val id = artifact.optLong("id", 0)
-            if (id == 0L || id.toString() == prefs.getString(PREF_SKIPPED_ARTIFACT, null)) return
-            val label = artifact.updatedAtShort() // "build <date>"
-        // Only builds created AFTER this install can be genuine updates.
-        // This skips the self-offer (the build the user already has) and any
-        // stale artifacts, without needing to track what was offered.
-        val firstInstall = packageManager.getPackageInfo(packageName, 0).firstInstallTime
-        val created = parseIsoUtc(artifact.optString("created_at"))
-        if (created != null && created <= firstInstall) return
+            if (!isNewer) return
+
+            val apkUrl = assetUrl(release, UPDATE_APK_ASSET) ?: return
+            val label = release.optString("name").takeIf { it.isNotBlank() }
+                ?: tag.ifEmpty { "latest build" }
             runOnUiThread {
-                updateArtifactId = id
+                updateApkUrl = apkUrl
+                updateTag = tag
                 updateBannerText.text = getString(R.string.update_banner, label)
                 updateBanner.visibility = View.VISIBLE
             }
         } catch (t: Throwable) {
-        // Silent: no network, rate limit, parse hiccup - never nag the user.
+            // Silent: no network, rate limit, parse hiccup - never nag the user.
         }
     }
 
-    private fun org.json.JSONObject.updatedAtShort(): String {
-        // "2026-09-17T00:13:27Z" -> "build Sep 17"
-        val raw = optString("updated_at")
-        val datePart = raw.takeIf { it.length >= 10 }?.substring(0, 10) ?: return "latest build"
-        return try {
-            val inFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-            val outFmt = SimpleDateFormat("MMM d", Locale.US)
-            "build " + outFmt.format(inFmt.parse(datePart)!!)
-        } catch (e: ParseException) {
-            "latest build"
+    /**
+     * Newest published release that carries our APK asset. The releases list
+     * is public for a public repo and comes back newest first, so the first
+     * hit is the build to offer; drafts and pre-releases are skipped because
+     * they are somebody's work in progress, not a release.
+     */
+    private fun newestReleaseWithApk(releases: JSONArray): JSONObject? {
+        for (i in 0 until releases.length()) {
+            val release = releases.optJSONObject(i) ?: continue
+            if (release.optBoolean("draft", false)) continue
+            if (release.optBoolean("prerelease", false)) continue
+            if (assetUrl(release, UPDATE_APK_ASSET) != null) return release
         }
+        return null
     }
+
+    /** Anonymous download URL of one named asset of [release], or null. */
+    private fun assetUrl(release: JSONObject, assetName: String): String? {
+        val assets = release.optJSONArray("assets") ?: return null
+        for (i in 0 until assets.length()) {
+            val asset = assets.optJSONObject(i) ?: continue
+            if (asset.optString("name") == assetName) {
+                return asset.optString("browser_download_url").takeIf { it.isNotBlank() }
+            }
+        }
+        return null
+    }
+
+    /**
+     * The build number the CI puts in a release tag ("build-21"). Anything
+     * else is reported as 0 so the caller falls back to the time-based check
+     * rather than reading a version number out of an unrelated tag.
+     */
+    private fun buildNumberFromTag(tag: String): Int =
+        Regex("""build-(\d+)""").matchEntire(tag)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+
+    /** Fallback "is it newer?" signal for a release tagged without a build number. */
+    private fun publishedAfterLastUpdate(release: JSONObject): Boolean {
+        val published = parseIsoUtc(release.optString("published_at")) ?: return false
+        val installed = packageManager.getPackageInfo(packageName, 0).lastUpdateTime
+        return published > installed
+    }
+
+    /** versionCode of the copy of Cosmos running right now. */
+    private fun installedVersionCode(): Int =
+        versionCodeOf(packageManager.getPackageInfo(packageName, 0))
+
+    /** versionCode of a parsed package, whichever API level read it. */
+    @Suppress("DEPRECATION")
+    private fun versionCodeOf(info: PackageInfo): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            info.longVersionCode.toInt()
+        } else {
+            info.versionCode
+        }
 
     private fun startUpdateDownload() {
-        val id = updateArtifactId ?: return
+        val url = updateApkUrl ?: return
         updateBannerText.text = getString(R.string.update_downloading, 0)
         Thread({
+            val apk = File(filesDir, UPDATE_APK_PATH)
             try {
-                val zip = File(cacheDir, UPDATE_ZIP_NAME)
-                val conn = urlConnection("$UPDATE_BASE_URL$UPDATE_ARTIFACTS_PATH/$id/zip")
-                val total = conn.contentLengthLong
-                conn.inputStream.use { input ->
-                    zip.outputStream().use { out ->
-                        val buf = ByteArray(64 * 1024)
-                        var read = 0L
-                        var lastPct = -1
-                        while (true) {
-                            val n = input.read(buf)
-                            if (n < 0) break
-                            out.write(buf, 0, n)
-                            read += n
-                            if (total > 0) {
-                                val pct = (read * 100 / total).toInt()
-                                if (pct != lastPct) {
-                                    lastPct = pct
-                                    runOnUiThread { updateBannerText.text = getString(R.string.update_downloading, pct) }
+                apk.parentFile?.mkdirs()
+                download(url, apk)
+                val problem = validateApk(apk)
+                if (problem == null) {
+                    runOnUiThread { installApk(apk) }
+                } else {
+                    apk.delete()
+                    runOnUiThread { failUpdate(getString(R.string.update_bad_apk, problem)) }
+                }
+            } catch (t: Throwable) {
+                apk.delete()
+                val reason = t.message ?: t.javaClass.simpleName
+                runOnUiThread { failUpdate(getString(R.string.update_download_failed, reason)) }
+            }
+        }, "cosmos-update").start()
+    }
+
+    /** Stream [url] to [target], reporting whole-percent progress in the banner. */
+    private fun download(url: String, target: File) {
+        val conn = urlConnection(url)
+        try {
+            // Artifact endpoints answer JSON error bodies with a 200-shaped
+            // read, so an HTTP status check comes before any bytes are kept.
+            val code = conn.responseCode
+            if (code !in 200..299) throw IOException("HTTP $code")
+            val total = conn.contentLengthLong
+            conn.inputStream.use { input ->
+                target.outputStream().use { out ->
+                    val buf = ByteArray(64 * 1024)
+                    var read = 0L
+                    var lastPct = -1
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        out.write(buf, 0, n)
+                        read += n
+                        if (total > 0) {
+                            val pct = (read * 100 / total).toInt()
+                            if (pct != lastPct) {
+                                lastPct = pct
+                                runOnUiThread {
+                                    updateBannerText.text =
+                                        getString(R.string.update_downloading, pct)
                                 }
                             }
                         }
                     }
                 }
-                val apk = File(filesDir, UPDATE_APK_PATH)
-                apk.parentFile?.mkdirs()
-                extractApk(zip, apk)
-                zip.delete()
-                runOnUiThread { launchInstaller(apk) }
+            }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /**
+     * Reject an unusable download before the installer ever sees it: a real
+     * APK is a zip carrying AndroidManifest.xml, and it has to be our own
+     * package and no older than what is already installed. Returns a short
+     * reason to show the user, or null when the APK looks installable.
+     */
+    private fun validateApk(apk: File): String? {
+        if (!apk.isFile || apk.length() == 0L) return "empty download"
+        return try {
+            ZipFile(apk).use { zip ->
+                if (zip.getEntry("AndroidManifest.xml") == null) return "not an Android package"
+            }
+            val info = packageManager.getPackageArchiveInfo(apk.absolutePath, 0)
+                ?: return "unreadable package"
+            when {
+                info.packageName != packageName -> "package ${info.packageName}"
+                versionCodeOf(info) < installedVersionCode() -> "older than the installed build"
+                else -> null
+            }
+        } catch (e: IOException) {
+            "not a zip archive"
+        }
+    }
+
+    /**
+     * Hand a validated APK to the system package installer. Android 8+ only
+     * lets an app do that once the user has allowed "install unknown apps" for
+     * it, so ask for that first and carry on when they come back; otherwise
+     * the intent lands nowhere and the update looks like it silently failed.
+     */
+    private fun installApk(apk: File) {
+        if (!canInstallPackages()) {
+            pendingInstallApk = apk
+            Toast.makeText(this, getString(R.string.update_allow_install), Toast.LENGTH_LONG)
+                .show()
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:$packageName")
+                    )
+                )
             } catch (t: Throwable) {
-                runOnUiThread {
-                    Toast.makeText(this, getString(R.string.update_install_failed), Toast.LENGTH_SHORT).show()
-                    updateBannerText.text = getString(R.string.update_banner, "latest build")
-                }
+                pendingInstallApk = null
+                failUpdate(getString(R.string.update_install_failed))
             }
-        }, "cosmos-update").start()
-    }
-
-    private fun extractApk(zip: File, target: File) {
-        ZipInputStream(zip.inputStream()).use { zin ->
-            while (true) {
-                val entry: ZipEntry = zin.nextEntry ?: break
-                if (entry.name.endsWith(".apk")) {
-                    FileOutputStream(target).use { out -> zin.copyTo(out) }
-                    return
-                }
-                zin.closeEntry()
-            }
+            return
         }
-        throw IllegalStateException("No APK inside the artifact")
+        pendingInstallApk = null
+        launchInstaller(apk)
     }
 
+    /** True when this app may hand an APK to the installer (always before 8.0). */
+    private fun canInstallPackages(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+            packageManager.canRequestPackageInstalls()
+
+    /**
+     * Start the system installer for [apk]. ACTION_VIEW with the APK mime type
+     * is what every OEM installer answers; ACTION_INSTALL_PACKAGE is the
+     * fallback for a build that advertises only that action. Whichever
+     * resolves also decides who gets the URI grant, which is why the old
+     * hard-coded "com.android.packageinstaller" grants were dropped.
+     */
     private fun launchInstaller(apk: File) {
-        try {
-            val uri = Uri.parse("content://${UPDATE_AUTHORITY}/update/${apk.name}")
-            // Belt-and-suspenders: grant read access explicitly, then start the
-            // installer via ACTION_VIEW (resolves on every OEM; ACTION_INSTALL_
-            // PACKAGE alone is flaky on some Android 14 builds).
-            grantUriPermission("com.android.packageinstaller", uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            grantUriPermission("com.google.android.packageinstaller", uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "application/vnd.android.package-archive")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
+        val uri = Uri.parse("content://${UPDATE_AUTHORITY}/update/${apk.name}")
+        val view = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, APK_MIME_TYPE)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        val install = Intent(Intent.ACTION_INSTALL_PACKAGE)
+            .setData(uri)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        for (intent in listOf(view, install)) {
+            val target = intent.resolveActivity(packageManager) ?: continue
+            grantReadTo(target.packageName, uri)
             startActivity(intent)
-        } catch (t: Throwable) {
-            Toast.makeText(this, getString(R.string.update_install_failed), Toast.LENGTH_SHORT).show()
+            return
         }
+        // Neither action resolved. Package visibility can hide an installer
+        // that would in fact answer, so make one honest attempt anyway rather
+        // than reporting a failure the system might not agree with.
+        try {
+            startActivity(view)
+        } catch (t: Throwable) {
+            failUpdate(getString(R.string.update_install_failed))
+        }
+    }
+
+    /**
+     * Explicit read grant for the download URI. The intent's own
+     * FLAG_GRANT_READ_URI_PERMISSION is what normally carries the permission;
+     * this additionally covers installers that re-open the URI from another
+     * process, and is never fatal when it is refused.
+     */
+    private fun grantReadTo(targetPackage: String, uri: Uri) {
+        try {
+            grantUriPermission(targetPackage, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (t: Throwable) {
+            // Ignore: the intent flag alone suffices on stock Android.
+        }
+    }
+
+    /** Show an update failure and leave the banner up for another attempt. */
+    private fun failUpdate(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+        updateBannerText.text = getString(R.string.update_retry)
+    }
+
+    /**
+     * One best-effort GET. Returns the body for a 2xx response and null for
+     * anything else - HTTP error, redirect loop, no network. The updater must
+     * never throw: an offline or rate-limited check simply finds nothing.
+     */
+    private fun httpGetBody(url: String): String? = try {
+        val conn = urlConnection(url)
+        // Pin the REST API version so the JSON schema stays as parsed here.
+        conn.setRequestProperty("Accept", "application/vnd.github+json")
+        try {
+            if (conn.responseCode in 200..299) {
+                conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
+            } else {
+                null
+            }
+        } finally {
+            conn.disconnect()
+        }
+    } catch (t: Throwable) {
+        null
     }
 
     private fun urlConnection(url: String): HttpURLConnection {
@@ -1042,7 +1232,6 @@ class MainActivity : Activity() {
 
 
     private companion object {
-        private var updateArtifactId: Long? = null
         // --- GLM chat ("Search") constants ---
 
         /** Z.ai OpenAI-compatible chat completions endpoint. */

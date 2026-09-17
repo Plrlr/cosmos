@@ -58,7 +58,7 @@ android/
     ├── build.gradle                # Android + Chaquopy config (python { version "3.11" })
     ├── proguard-rules.pro
     └── src/main/
-        ├── AndroidManifest.xml     # INTERNET only, no storage permission
+        ├── AndroidManifest.xml     # INTERNET + REQUEST_INSTALL_PACKAGES only
         ├── java/com/cosmos/app/MainActivity.kt
         ├── python/
         │   ├── runner.py           # SystemExit-safe wrapper around cli.main()
@@ -109,7 +109,9 @@ upload) and this folder:
    automatically on push to `main`/`master`; you can also trigger it by hand:
    **Actions** tab → **Build Cosmos APK** → **Run workflow**.
 3. When the run finishes, open the **Actions** tab → the finished run →
-   **Summary** → **Artifacts**, and download `cosmos-debug-apk`.
+   **Summary** → **Artifacts**, and download `cosmos-debug-apk` — or take
+   `cosmos-debug.apk` from the newest entry under **Releases**, which is the
+   copy the in-app updater reads.
 
 `gradle-wrapper.jar` is intentionally not needed: the workflow installs
 Gradle 8.9 itself (`gradle/actions/setup-gradle@v4`), sets up JDK 17 and the
@@ -196,6 +198,46 @@ Notes:
 - `android:configChanges` on the activity prevents rotation from restarting
   the pipeline; a fresh launch simply regenerates today's report.
 
+## Auto-update
+
+Every push to `main` builds an APK and publishes it as a **GitHub release**
+(tagged `build-<versionCode>`) in the last step of the workflow. On launch the
+app asks GitHub's public releases API for the newest release carrying its APK
+asset and, when that build is newer than the installed one, offers it in a
+banner along the top of the screen.
+
+- **Why releases and not Actions artifacts?** The artifact zip endpoint answers
+  `401 Requires authentication` to an unauthenticated client *even for a public
+  repository*, so an app without a token can list artifacts but can never
+  download one. To confirm:
+
+  ```bash
+  curl -sLi -H 'User-Agent: x' \
+    https://api.github.com/repos/Plrlr/cosmos/actions/artifacts/<artifact-id>/zip
+  ```
+
+  Artifacts also expire (90 days by default), while a release asset downloads
+  anonymously and permanently.
+- **Version numbers.** The workflow passes `COSMOS_VERSION_CODE=<run number>`
+  to Gradle, so the APK's `versionCode` *is* the CI run number: strictly larger
+  on every push, which is what lets each build install over the previous one.
+  The release tag carries the same number (`build-21`), so the app decides
+  "newer?" by comparing numbers rather than trusting the device clock. A local
+  build falls back to the checked-in `versionCode` (8) and so cannot install
+  over a CI build — expected, and only affects development.
+- **Installing.** Android 8+ requires `REQUEST_INSTALL_PACKAGES` (declared in
+  the manifest) *and* the user's permission under **Settings → Apps → Cosmos →
+  Install unknown apps**. When that is still off, the app opens that screen for
+  you and finishes the install when you come back.
+- **Before the installer runs**, the downloaded file is checked: it must be a
+  zip containing `AndroidManifest.xml`, it must be `com.cosmos.app`, and it must
+  not be older than the installed copy. Each failure names the step that broke
+  (download, validation, or installer) instead of one catch-all message.
+- **One manual install is needed** for any copy built before this channel
+  existed — an old APK keeps asking the artifact endpoint and reports
+  "Couldn't open the installer". Install the newest APK from **Releases** once;
+  after that the in-app updater takes over.
+
 ## Re-syncing the Python package
 
 After editing anything under `news_hub/` (the package at the workspace root),
@@ -221,3 +263,14 @@ or manually: copy `__init__.py`, `cli.py`, `core.py`, `geometry.py`,
   are recorded in the report's collection notes and never abort the brief.
 - **Debug the pipeline**: `adb logcat -s python.stdout python.stderr` shows the
   CLI's own progress prints.
+- **"Update download failed: HTTP 401"**: the installed build predates the
+  release channel and is still pointed at Actions artifacts, which reject
+  unauthenticated downloads. Install the newest APK from **Releases** once.
+- **"The downloaded update is not installable: …"**: the download finished (the
+  banner showed a percentage) but the file failed validation — the message says
+  which check, e.g. `not a zip archive` when an error page was saved instead of
+  an APK.
+- **"Couldn't open the installer."**: no activity answered the install intent,
+  which in practice means no package installer is visible to the app. The
+  manifest's `<queries>` block and `REQUEST_INSTALL_PACKAGES` are what make one
+  visible and legal to call.

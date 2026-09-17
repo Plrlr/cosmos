@@ -1,10 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- All feeds are fetched over https by Python's urllib; no other
-         permission is needed. Reports are written to app-private storage
-         (filesDir), so no storage permission either. -->
+    <!-- All feeds are fetched over https by Python's urllib. Reports and the
+         downloaded update APK are written to app-private storage (filesDir),
+         so no storage permission is needed. -->
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Since Android 8.0 (API 26) an app can only hand an APK to the system
+         package installer when it declares this permission. Without it the
+         install intent is refused, which is what made the auto-update look
+         like it "couldn't open the installer". The user still has to allow
+         "install unknown apps" for Cosmos; the app asks for that separately. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- Package visibility (Android 11+): let the app see the system package
          installer so the auto-update install intent can resolve. -->

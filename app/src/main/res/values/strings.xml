@@ -38,5 +38,12 @@
     <string name="update_downloading">Downloading… %1$d%%</string>
     <string name="update_skip">✕</string>
     <string name="chat_rate_limited">The AI service is busy right now (rate limit). I retried automatically — please try again in a minute.</string>
+    <!-- Update failures are reported per step: a download that never arrived,
+         an APK that failed validation, a missing install permission, and a
+         genuine "no installer to hand it to" are different problems. -->
     <string name="update_install_failed">Couldn&#8217;t open the installer.</string>
+    <string name="update_download_failed">Update download failed: %1$s</string>
+    <string name="update_bad_apk">The downloaded update is not installable: %1$s</string>
+    <string name="update_allow_install">Allow Cosmos to install apps to finish updating, then come back.</string>
+    <string name="update_retry">Update failed — tap to retry</string>
 </resources>

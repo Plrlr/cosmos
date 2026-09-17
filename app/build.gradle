@@ -4,6 +4,13 @@ plugins {
     id 'com.chaquo.python'
 }
 
+// CI stamps its own run number here (COSMOS_VERSION_CODE) so every pushed
+// build carries a strictly larger versionCode than the last one. A newer build
+// then installs straight over an older copy, and the in-app updater can decide
+// "is there something newer?" by comparing numbers instead of device and
+// server clocks. A local build keeps the checked-in value.
+def cosmosVersionCode = (System.getenv("COSMOS_VERSION_CODE") ?: "8").toInteger()
+
 android {
     namespace 'com.cosmos.app'
     compileSdk 34
@@ -12,7 +19,7 @@ android {
         applicationId "com.cosmos.app"
         minSdk 24
         targetSdk 34
-        versionCode 8
+        versionCode cosmosVersionCode
         versionName "1.7"
 
         ndk {
