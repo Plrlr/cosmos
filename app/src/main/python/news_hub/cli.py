@@ -255,6 +255,11 @@ def main(argv: list[str] | None = None) -> int:
             f"Diversity pick: {len({story.source for story in selection.stories})} distinct outlets from "
             f"{len(selection.stories)} slots."
         )
+        if selection.skipped:
+            print(
+                f"Spread test: {selection.skipped} qualifying candidate(s) were not picked, "
+                f"{len(selection.skipped_similar)} of them near-copies of a chosen lead."
+            )
     if selection.at_capacity:
         print("Radius ceiling reached; the brief is deliberately short because the evidence is thin.")
 

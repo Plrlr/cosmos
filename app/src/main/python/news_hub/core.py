@@ -177,6 +177,22 @@ class Story:
 
 
 @dataclass
+class NearDuplicate:
+    """A candidate the spread test set aside because a chosen lead already covers it.
+
+    ``similarity`` is the cube kernel the pick itself measures, and ``overlap`` is the
+    title-token overlap :func:`deduplicate` folds on. They answer different questions --
+    "same kind of evidence" versus "same event" -- and keeping both is what lets the
+    report tell a missed fold apart from a cube too coarse to separate two stories.
+    """
+
+    story: Story
+    twin: Story
+    similarity: float
+    overlap: float
+
+
+@dataclass
 class Selection:
     """The ball around the origin that produced the brief, and how it was filled."""
 
@@ -187,6 +203,11 @@ class Selection:
     mode: str = "ball"
     feasible: int = 0
     candidates: int = 0
+    #: Candidates that cleared the ball but the spread test did not pick, and the
+    #: ones it rejected specifically for duplicating a chosen lead.
+    skipped: int = 0
+    skipped_similar: list[NearDuplicate] = field(default_factory=list)
+    sigma: float = 0.15
 
     @property
     def surface(self) -> str:
@@ -439,6 +460,10 @@ def classify(story: Story) -> str:
     return best
 
 
+#: Title-token overlap at which two headlines count as one story.
+DEDUPLICATION_SIMILARITY = 0.52
+
+
 def _tokens(title: str) -> set[str]:
     stop = {"this", "that", "with", "from", "about", "after", "says", "what", "amid", "into"}
     return {token for token in re.findall(r"[a-z0-9]{4,}", title.lower()) if token not in stop}
@@ -458,7 +483,7 @@ def _authority_key(story: Story) -> tuple[int, float, str]:
     return (story.source_tier, -published.timestamp(), story.title)
 
 
-def deduplicate(stories: Iterable[Story], similarity: float = 0.52) -> list[Story]:
+def deduplicate(stories: Iterable[Story], similarity: float = DEDUPLICATION_SIMILARITY) -> list[Story]:
     """Collapse near-identical headlines while preserving corroborating outlets.
 
     Clustering is done against each cluster's *representative* headline rather
@@ -602,6 +627,13 @@ def _annotate_neighbours(
             )
 
 
+#: A dropped candidate is only named as a near-copy once the spread kernel puts it
+#: this close to a chosen lead; below the floor it lost on quality, not redundancy.
+NEAR_DUPLICATE_FLOOR = 0.5
+#: How many named skips a report lists before it just counts the rest.
+NEAR_DUPLICATE_LIMIT = 8
+
+
 def select_on_manifold(
     stories: Sequence[Story],
     quota: int = 24,
@@ -630,17 +662,50 @@ def select_on_manifold(
     indices, star = geometry.ball_selection(radii, candidates, max_radius)
     feasible = [stories[index] for index in indices]
     chosen = feasible
+    skipped = 0
+    near_duplicates: list[NearDuplicate] = []
     if mode == "diverse" and len(feasible) > quota:
+        points = [story.axes for story in feasible]
+        qualities = [max(0.0, 1.0 - story.radius) for story in feasible]
         picked = geometry.diverse_selection(
-            points=[story.axes for story in feasible],
-            qualities=[max(0.0, 1.0 - story.radius) for story in feasible],
+            points=points,
+            qualities=qualities,
             quota=quota,
             metric=metric,
             sigma=sigma,
         )
         chosen = [feasible[index] for index in picked]
+        skipped = len(feasible) - len(chosen)
+        # The rule that removed them is otherwise invisible in the report, so keep
+        # the reason: which chosen lead each rejected candidate duplicates.
+        near_duplicates = [
+            NearDuplicate(
+                feasible[index],
+                feasible[twin],
+                similarity,
+                _similarity(_tokens(feasible[index].title), _tokens(feasible[twin].title)),
+            )
+            for index, twin, similarity in geometry.diversity_drops(
+                points, picked, metric=metric, sigma=sigma, floor=NEAR_DUPLICATE_FLOOR
+            )
+        ]
+        # Word overlap first: the cube rates most of the pool equally redundant, so a
+        # genuine duplicate is the row worth reading, and it is the one a reader can
+        # confirm from the two headlines alone.
+        near_duplicates.sort(key=lambda entry: (-entry.overlap, -entry.similarity, entry.story.title))
     capacity = max_radius is not None and star >= float(max_radius) - 1e-12 and len(chosen) < quota
-    return Selection(chosen, star, quota, capacity, mode, len(feasible), len(feasible))
+    return Selection(
+        chosen,
+        star,
+        quota,
+        capacity,
+        mode,
+        len(feasible),
+        len(feasible),
+        skipped=skipped,
+        skipped_similar=near_duplicates,
+        sigma=sigma,
+    )
 
 
 def collect_with_stats(
@@ -1212,6 +1277,78 @@ def _displaced_note(displaced: int, per_source: int, total: int) -> str:
     )
 
 
+def _skip_block(selection: Selection) -> str:
+    """The spread test's rejects, named, so the brief's strongest claim is auditable.
+
+    A ball is a per-item rule, so the diversity pass is the only step that removes
+    something which already qualified. Naming its casualties is the difference
+    between a rule the reader can check and one they have to trust.
+    """
+    if selection.mode != "diverse" or not selection.skipped:
+        return ""
+    named = selection.skipped_similar
+    if not named:
+        return (
+            f'<p class="story-meta">{selection.skipped} candidate(s) cleared the surface but were not picked; '
+            "none sits in the same corner of the cube as a chosen lead, so each was set aside on quality.</p>"
+        )
+    same_event = sum(1 for entry in named if entry.overlap >= DEDUPLICATION_SIMILARITY)
+    rows = "".join(
+        f"<li>{_esc(entry.story.title)} ({_esc(entry.story.source)}, |d|_W {entry.story.radius:.3f}) "
+        f"&mdash; cube {entry.similarity:.2f} · title words {entry.overlap:.2f} &mdash; "
+        f"matches {_esc(entry.twin.title)} ({_esc(entry.twin.source)})</li>"
+        for entry in named[:NEAR_DUPLICATE_LIMIT]
+    )
+    tail = (
+        f" {len(named) - NEAR_DUPLICATE_LIMIT} further row(s) are counted but not listed."
+        if len(named) > NEAR_DUPLICATE_LIMIT
+        else ""
+    )
+    return (
+        f'<details class="stats"><summary>Set aside by the spread test '
+        f'({selection.skipped} of {selection.candidates} candidates were not picked; '
+        f'{same_event} of them match a chosen lead on wording too)</summary>'
+        f"<ul>{rows}</ul>"
+        f'<p class="story-meta"><strong>Cube</strong> is the spread kernel '
+        f"exp(-|d_i - d_j|^2 / 2 sigma^2) at sigma = {selection.sigma:.2f}, which is what the pick "
+        f"measures: 1.00 means the two leads carry the same kind of evidence, 0.00 means unrelated. "
+        f"<strong>Title words</strong> is the overlap the deduplication pass folds on at "
+        f"{DEDUPLICATION_SIMILARITY:.2f}, so a row high on both is one event that survived the fold. "
+        f"Rows high on the cube and low on the words are different stories the cube cannot tell apart. "
+        f"Listed by title overlap.{tail}</p></details>"
+    )
+
+
+def _skip_lines(selection: Selection) -> list[str]:
+    """Text-report form of :func:`_skip_block`."""
+    if selection.mode != "diverse" or not selection.skipped:
+        return []
+    named = selection.skipped_similar
+    if not named:
+        return [
+            f"Set aside by the spread test: {selection.skipped} candidate(s) cleared the surface, none of them "
+            "in the same corner of the cube as a chosen lead, so each was dropped on quality"
+        ]
+    same_event = sum(1 for entry in named if entry.overlap >= DEDUPLICATION_SIMILARITY)
+    lines = [
+        f"Set aside by the spread test: {selection.skipped} of {selection.candidates} candidates were not "
+        f"picked; {same_event} of them match a chosen lead on wording too",
+        f"  cube = spread kernel exp(-|d_i - d_j|^2 / 2 sigma^2) at sigma = {selection.sigma:.2f} "
+        f"(1.00 = same kind of evidence, 0.00 = unrelated)",
+        f"  title words = overlap the deduplication pass folds on at {DEDUPLICATION_SIMILARITY:.2f}; "
+        "listed by title overlap, so a high cube with low words is a story the cube cannot tell apart",
+    ]
+    for entry in named[:NEAR_DUPLICATE_LIMIT]:
+        lines.append(
+            f"  - {entry.story.title} ({entry.story.source}, |d|_W {entry.story.radius:.3f}) -- "
+            f"cube {entry.similarity:.2f}, title words {entry.overlap:.2f}, "
+            f"matches {entry.twin.title} ({entry.twin.source})"
+        )
+    if len(named) > NEAR_DUPLICATE_LIMIT:
+        lines.append(f"  ({len(named) - NEAR_DUPLICATE_LIMIT} further row(s) not listed)")
+    return lines
+
+
 def _render_regions(stories: Sequence[Story], metric: geometry.Metric) -> str:
     rows = []
     for category in CATEGORIES:
@@ -1367,7 +1504,8 @@ footer{{margin-top:38px;color:#667085;font-size:12px}}
 confirmed, on topic, with a usable summary); {excluded} fell outside it. The brief shows {chosen} of them.{capacity_note}
 Filling rule: {_describe_selection(selection)}.
 Metric: <span class="coords">{_esc(metric.describe())}</span>. An item gets in on where it sits in the cube,
-not because it won a leaderboard.</div>
+not because it won a leaderboard.
+{_skip_block(selection)}</div>
 <section><h2>What changed</h2><ul>{executive or '<li>No live stories collected.</li>'}</ul></section>
 <section><h2>Problems to watch</h2><ul>{problems or '<li>No geopolitics/economics leads collected.</li>'}</ul></section>
 <section><h2>Salience map · age × authority</h2>
@@ -1409,6 +1547,7 @@ def render_text(
         f"{max(0, len(stories) - selection.candidates)} fell outside the surface.",
         f"Brief shows {chosen} of the {selection.candidates} candidates.",
         f"Filling rule: {_describe_selection(selection)}",
+        *_skip_lines(selection),
         f"Metric: {metric.describe()}",
         "Coordinates are deficits in [0,1]: 0 is ideal, 1 is no evidence at all.",
     ]

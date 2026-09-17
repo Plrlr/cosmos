@@ -587,6 +587,23 @@ PRIOR_METRIC = prior_metric()
 # --------------------------------------------------------------------------- #
 # Set-level selection: quality x diversity
 # --------------------------------------------------------------------------- #
+def spread_similarity(
+    a: Sequence[float],
+    b: Sequence[float],
+    metric: Metric | None = None,
+    sigma: float = 0.15,
+) -> float:
+    """How close two items sit in the cube: ``1.0`` is the same point, ``0.0`` unrelated.
+
+    This is the ``exp(-|d_i - d_j|^2 / (2 sigma^2))`` factor that decides whether two
+    leads occupy the same neighbourhood, and it lives in one place so the diversity
+    pick and the report's explanation of that pick can never drift apart.
+    """
+    metric = metric or PRIOR_METRIC
+    spread = max(1e-6, abs(float(sigma)))
+    return math.exp(-(metric.distance(a, b) ** 2) / (2.0 * spread * spread))
+
+
 def diverse_selection(
     points: Sequence[Sequence[float]],
     qualities: Sequence[float],
@@ -620,10 +637,7 @@ def diverse_selection(
         return []
     quality = [max(1e-6, float(value)) for value in qualities]
     kernel = [
-        [
-            1.0 + jitter if i == j else math.exp(-(metric.distance(a, b) ** 2) / (2.0 * sigma * sigma))
-            for j, b in enumerate(points)
-        ]
+        [1.0 + jitter if i == j else spread_similarity(a, b, metric, sigma) for j, b in enumerate(points)]
         for i, a in enumerate(points)
     ]
     likelihood = [
@@ -648,6 +662,42 @@ def diverse_selection(
             row.append(coefficient)
             remaining[index] = max(0.0, remaining[index] - coefficient * coefficient)
     return chosen
+
+
+def diversity_drops(
+    points: Sequence[Sequence[float]],
+    picked: Sequence[int],
+    metric: Metric | None = None,
+    sigma: float = 0.15,
+    floor: float = 0.0,
+) -> list[tuple[int, int, float]]:
+    """Name what the spread test left behind: ``(index, twin, similarity)`` rows.
+
+    :func:`diverse_selection` returns only what it kept, which leaves the pipeline's
+    strongest claim unauditable: a lead that cleared the ball can vanish from the
+    brief without the report saying why. This re-derives the reason from the same
+    kernel -- for every item the pick did not take, the chosen item it most
+    resembles and how close the two are -- so the report can show its work.
+
+    ``floor`` suppresses the near-misses, which were dropped on quality rather than
+    redundancy. Rows come back most-similar first, so a caller can show the top few
+    and count the rest; ties inside the pick resolve to the earlier, better pick.
+    """
+    metric = metric or PRIOR_METRIC
+    size = len(points)
+    kept = [index for index in dict.fromkeys(picked) if 0 <= index < size]
+    if not kept:
+        return []
+    dropped: list[tuple[int, int, float]] = []
+    for index in range(size):
+        if index in kept:
+            continue
+        twin = max(kept, key=lambda candidate: spread_similarity(points[index], points[candidate], metric, sigma))
+        similarity = spread_similarity(points[index], points[twin], metric, sigma)
+        if similarity >= floor:
+            dropped.append((index, twin, similarity))
+    dropped.sort(key=lambda row: (-row[2], row[0]))
+    return dropped
 
 
 def normalize_coordinates(points: Sequence[Sequence[float]]) -> list[tuple[float, ...]]:
