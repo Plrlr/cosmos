@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.text.InputType
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
@@ -574,12 +575,14 @@ class MainActivity : Activity() {
         val keyInput = EditText(this).apply {
             hint = getString(R.string.chat_key_field_hint)
             setText(prefs.getString(PREF_API_KEY, ""))
-            singleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            setSingleLine(true)
         }
         val modelInput = EditText(this).apply {
             hint = getString(R.string.chat_model_field_hint)
             setText(prefs.getString(PREF_MODEL, DEFAULT_MODEL))
-            singleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT
+            setSingleLine(true)
         }
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -786,10 +789,11 @@ class MainActivity : Activity() {
             h1{font-size:18px;margin:0 0 12px}.muted{color:#667085;font-size:12px}
             ul{list-style:none;padding:0;margin:0}li{margin:0 0 16px;font-size:15px}
             a{color:#174ea6;text-decoration:none}
-            .search{margin:0 0 20px}.search a{display:inline-block;padding:8px 14px;margin-left:-14px;font-size:14px}
+            .head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 16px}
+            .head h1{margin:0}
+            .search a{display:inline-block;padding:7px 14px;border:1px solid #c6d4ee;border-radius:10px;background:#f4f7fd;font-size:14px;font-weight:600}
             </style></head><body>
-            <h1>Cosmos</h1>
-            <p class="search"><a href="cosmos://search">${getString(R.string.search_button)}</a></p>
+            <div class="head"><h1>Cosmos</h1><p class="search"><a href="cosmos://search">${getString(R.string.search_button)}</a></p></div>
             ${if (entries.isEmpty()) """<p class="muted">No saved issues yet.</p>""" else ""}
             <ul>$entries</ul>
             </body></html>
