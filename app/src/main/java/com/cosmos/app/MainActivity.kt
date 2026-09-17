@@ -428,7 +428,13 @@ class MainActivity : Activity() {
                 JSONArray().put(
                     JSONObject()
                         .put("type", "web_search")
-                        .put("web_search", JSONObject().put("enable", true))
+                        .put(
+                            "web_search",
+                            JSONObject()
+                                .put("enable", true)
+                                .put("search", true)
+                                .put("search_result", 8)
+                        )
                 )
             )
         }
@@ -1011,8 +1017,12 @@ class MainActivity : Activity() {
         /** Sent as the fixed system message ahead of the capped history. */
         private const val CHAT_SYSTEM_PROMPT =
             "You are Cosmos, the assistant inside a personal news reader. Be " +
-                "concise and factual. Use web search when the question needs " +
-                "fresh information."
+                "concise and factual. ALWAYS use web search for any question about " +
+                "current events, news, prices, weather, sports, schedules, or anything " +
+                "time-sensitive - even if you believe you already know the answer. " +
+                "Never answer such questions from memory alone; your built-in knowledge " +
+                "has a cutoff and is outdated. If web search is unavailable or returns " +
+                "nothing, say so explicitly instead of guessing."
 
         /** Where the chat's API key and model name are stored. */
         private const val CHAT_PREFS_NAME = "cosmos_settings"
