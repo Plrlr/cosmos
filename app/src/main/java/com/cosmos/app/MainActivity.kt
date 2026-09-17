@@ -47,6 +47,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import kotlin.math.roundToInt
 import org.json.JSONArray
 import org.json.JSONObject
@@ -60,9 +61,8 @@ private const val UPDATE_ZIP_NAME = "cosmos-update.zip"
 private const val UPDATE_APK_DIR = "update"
 private const val UPDATE_APK_PATH = "update/app-debug.apk"
 private const val PREF_LAST_CHECK_MS = "last_update_check_ms"
-private const val PREF_LAST_SEEN_ARTIFACT = "last_seen_artifact_id"
 private const val PREF_SKIPPED_ARTIFACT = "skipped_artifact_id"
-private const val UPDATE_CHECK_INTERVAL_MS = 30L * 60L * 1000L
+private const val UPDATE_CHECK_INTERVAL_MS = 60_000L  // one check per launch; 1-minute guard
 private const val CHAT_CODE_RATE_LIMIT = 1302
 private const val CHAT_CODE_OVERLOAD = 1305
 private const val CHAT_CODE_USAGE = 1308
@@ -120,7 +120,7 @@ class MainActivity : Activity() {
     /** True while a chat request is in flight; guards the Send button. */
     private var chatRequestInFlight = false
 
-    /** The transient "Thinkingâ€¦" bubble, removed when the reply lands. */
+    /** The transient "ThinkingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" bubble, removed when the reply lands. */
     private var chatThinkingView: TextView? = null
 
     /**
@@ -404,7 +404,7 @@ class MainActivity : Activity() {
         runOnUiThread { onChatOutcome(outcome) }
     }
 
-    /** UI-thread completion: swap the "Thinkingâ€¦" bubble for the reply/error. */
+    /** UI-thread completion: swap the "ThinkingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" bubble for the reply/error. */
     private fun onChatOutcome(outcome: ChatOutcome) {
         chatRequestInFlight = false
         chatSend.isEnabled = true
@@ -610,7 +610,7 @@ class MainActivity : Activity() {
         bubble.setTextColor(BUBBLE_MUTED_COLOR)
     }
 
-    /** Transient "Thinkingâ€¦" placeholder; kept so it can be removed later. */
+    /** Transient "ThinkingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" placeholder; kept so it can be removed later. */
     private fun addThinkingBubble(): TextView {
         val bubble = addChatBubble(getString(R.string.chat_thinking), fromUser = false)
         bubble.setTextColor(BUBBLE_MUTED_COLOR)
@@ -849,7 +849,7 @@ class MainActivity : Activity() {
                 set(year.toInt(), month.toInt() - 1, day.toInt())
             }
             val label = humanDate.format(date.time)
-            val prefix = if (file.name == todayName) "Today Â· " else ""
+            val prefix = if (file.name == todayName) "Today Ãƒâ€šÃ‚Â· " else ""
             entries.append("""<li><a href="${file.name}">$prefix$label</a></li>""")
         }
 
@@ -927,15 +927,19 @@ class MainActivity : Activity() {
             val id = artifact.optLong("id", 0)
             if (id == 0L || id.toString() == prefs.getString(PREF_SKIPPED_ARTIFACT, null)) return
             val label = artifact.updatedAtShort() // "build <date>"
-            if (id.toString() == prefs.getString(PREF_LAST_SEEN_ARTIFACT, null)) return // already offered
-            prefs.edit().putString(PREF_LAST_SEEN_ARTIFACT, id.toString()).apply()
+        // Only builds created AFTER this install can be genuine updates.
+        // This skips the self-offer (the build the user already has) and any
+        // stale artifacts, without needing to track what was offered.
+        val firstInstall = packageManager.getPackageInfo(packageName, 0).firstInstallTime
+        val created = parseIsoUtc(artifact.optString("created_at"))
+        if (created != null && created <= firstInstall) return
             runOnUiThread {
                 updateArtifactId = id
                 updateBannerText.text = getString(R.string.update_banner, label)
                 updateBanner.visibility = View.VISIBLE
             }
         } catch (t: Throwable) {
-            // Silent: no network, rate limit, parse hiccup â€” never nag the user.
+            // Silent: no network, rate limit, parse hiccup ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â never nag the user.
         }
     }
 
@@ -1191,4 +1195,11 @@ class UpdateFileProvider : ContentProvider() {
     override fun delete(uri: android.net.Uri, selection: String?, args: Array<out String>?): Int = 0
     override fun update(uri: android.net.Uri, values: ContentValues?, selection: String?, args: Array<out String>?): Int = 0
 }
-
+/** Parse GitHub API ISO-8601 UTC timestamps ("2026-09-17T06:22:41Z") to epoch ms. */
+private fun parseIsoUtc(raw: String): Long? = try {
+    val fmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+    fmt.timeZone = TimeZone.getTimeZone("UTC")
+    fmt.parse(raw)?.time
+} catch (e: ParseException) {
+    null
+}
