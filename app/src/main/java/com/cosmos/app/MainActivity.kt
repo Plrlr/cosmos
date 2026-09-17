@@ -160,7 +160,7 @@ class MainActivity : Activity() {
         // Starting Python and running the pipeline both block, so do it off
         // the UI thread; the completion path hops back via runOnUiThread().
         Thread(::runPipeline, "cosmos-pipeline").start()
-        checkForUpdate()
+        Thread({ checkForUpdate() }, "cosmos-update-check").start()
     }
 
     private fun configureWebView() {
