@@ -913,7 +913,8 @@ class MainActivity : Activity() {
             val conn = urlConnection(UPDATE_ARTIFACTS_URL)
             val body = conn.inputStream.use { it.readBytes() }.toString(Charsets.UTF_8)
             conn.disconnect()
-            val arr = org.json.JSONArray(body)
+            // GitHub wraps the list: {"total_count": N, "artifacts": [...]}
+            val arr = JSONObject(body).getJSONArray("artifacts")
             var newest: org.json.JSONObject? = null
             for (i in 0 until arr.length()) {
                 val a = arr.getJSONObject(i)
