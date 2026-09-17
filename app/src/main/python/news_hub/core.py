@@ -1052,8 +1052,8 @@ def _render_map_svg(
     rejected: Sequence[Story] = (),
     labels: dict[int, str] | None = None,
     metric: geometry.Metric | None = None,
-    width: int = 560,
-    height: int = 560,
+    width: int = 440,
+    height: int = 440,
 ) -> str:
     """Inline SVG of the salience map as a bare 2-D dot field.
 
