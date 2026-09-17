@@ -51,6 +51,20 @@ import kotlin.math.roundToInt
 import org.json.JSONArray
 import org.json.JSONObject
 
+private const val UPDATE_ARTIFACTS_URL = "https://api.github.com/repos/Plrlr/cosmos/actions/artifacts?per_page=5"
+private const val UPDATE_BASE_URL = "https://api.github.com/repos/Plrlr/cosmos/actions"
+private const val UPDATE_ARTIFACTS_PATH = "artifacts"
+private const val UPDATE_ARTIFACT_NAME = "cosmos-debug-apk"
+private const val UPDATE_AUTHORITY = "com.cosmos.app.update"
+private const val UPDATE_ZIP_NAME = "cosmos-update.zip"
+private const val UPDATE_APK_DIR = "update"
+private const val UPDATE_APK_PATH = "update/app-debug.apk"
+private const val PREF_LAST_CHECK_MS = "last_update_check_ms"
+private const val PREF_LAST_SEEN_ARTIFACT = "last_seen_artifact_id"
+private const val PREF_SKIPPED_ARTIFACT = "skipped_artifact_id"
+private const val UPDATE_CHECK_INTERVAL_MS = 30L * 60L * 1000L
+
+
 /**
  * Single-activity app: show a loading screen, run the news_hub pipeline in
  * Python on a background thread, then display the generated HTML report in a
@@ -103,7 +117,7 @@ class MainActivity : Activity() {
     /** True while a chat request is in flight; guards the Send button. */
     private var chatRequestInFlight = false
 
-    /** The transient "Thinking…" bubble, removed when the reply lands. */
+    /** The transient "Thinkingâ€¦" bubble, removed when the reply lands. */
     private var chatThinkingView: TextView? = null
 
     /**
@@ -369,7 +383,7 @@ class MainActivity : Activity() {
         runOnUiThread { onChatOutcome(outcome) }
     }
 
-    /** UI-thread completion: swap the "Thinking…" bubble for the reply/error. */
+    /** UI-thread completion: swap the "Thinkingâ€¦" bubble for the reply/error. */
     private fun onChatOutcome(outcome: ChatOutcome) {
         chatRequestInFlight = false
         chatSend.isEnabled = true
@@ -567,7 +581,7 @@ class MainActivity : Activity() {
         bubble.setTextColor(BUBBLE_MUTED_COLOR)
     }
 
-    /** Transient "Thinking…" placeholder; kept so it can be removed later. */
+    /** Transient "Thinkingâ€¦" placeholder; kept so it can be removed later. */
     private fun addThinkingBubble(): TextView {
         val bubble = addChatBubble(getString(R.string.chat_thinking), fromUser = false)
         bubble.setTextColor(BUBBLE_MUTED_COLOR)
@@ -806,7 +820,7 @@ class MainActivity : Activity() {
                 set(year.toInt(), month.toInt() - 1, day.toInt())
             }
             val label = humanDate.format(date.time)
-            val prefix = if (file.name == todayName) "Today · " else ""
+            val prefix = if (file.name == todayName) "Today Â· " else ""
             entries.append("""<li><a href="${file.name}">$prefix$label</a></li>""")
         }
 
@@ -891,7 +905,7 @@ class MainActivity : Activity() {
                 updateBanner.visibility = View.VISIBLE
             }
         } catch (t: Throwable) {
-            // Silent: no network, rate limit, parse hiccup — never nag the user.
+            // Silent: no network, rate limit, parse hiccup â€” never nag the user.
         }
     }
 
@@ -986,39 +1000,8 @@ class MainActivity : Activity() {
         return conn
     }
 
-    /**
-     * Minimal read-only provider so the package installer (API 24+) can read
-     * the downloaded APK from app-private storage via a content:// URI.
-     */
-    class UpdateFileProvider : ContentProvider() {
-        override fun onCreate(): Boolean = true
-        override fun getType(uri: android.net.Uri): String = "application/vnd.android.package-archive"
-        override fun openFile(uri: android.net.Uri, mode: String): ParcelFileDescriptor {
-            if (mode != "r") throw SecurityException("read-only provider")
-            val name = uri.lastPathSegment ?: throw IllegalArgumentException("no file")
-            if (!name.endsWith(".apk")) throw IllegalArgumentException("apk only")
-            val file = File(requireNotNull(context).filesDir, "$UPDATE_APK_DIR/$name")
-            return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-        }
-        override fun query(uri: android.net.Uri, projection: Array<out String>?, selection: String?, args: Array<out String>?, order: String?): Cursor? = null
-        override fun insert(uri: android.net.Uri, values: ContentValues?): android.net.Uri? = null
-        override fun delete(uri: android.net.Uri, selection: String?, args: Array<out String>?): Int = 0
-        override fun update(uri: android.net.Uri, values: ContentValues?, selection: String?, args: Array<out String>?): Int = 0
-    }
 
     private companion object {
-        private const val UPDATE_ARTIFACTS_URL = "https://api.github.com/repos/Plrlr/cosmos/actions/artifacts?per_page=5"
-        private const val UPDATE_BASE_URL = "https://api.github.com/repos/Plrlr/cosmos/actions"
-        private const val UPDATE_ARTIFACTS_PATH = "artifacts"
-        private const val UPDATE_ARTIFACT_NAME = "cosmos-debug-apk"
-        private const val UPDATE_AUTHORITY = "com.cosmos.app.update"
-        private const val UPDATE_ZIP_NAME = "cosmos-update.zip"
-        private const val UPDATE_APK_DIR = "update"
-        private const val UPDATE_APK_PATH = "update/app-debug.apk"
-        private const val PREF_LAST_CHECK_MS = "last_update_check_ms"
-        private const val PREF_LAST_SEEN_ARTIFACT = "last_seen_artifact_id"
-        private const val PREF_SKIPPED_ARTIFACT = "skipped_artifact_id"
-        private const val UPDATE_CHECK_INTERVAL_MS = 30L * 60L * 1000L
         private var updateArtifactId: Long? = null
         // --- GLM chat ("Search") constants ---
 
@@ -1151,3 +1134,27 @@ class MainActivity : Activity() {
         }
     }
 }
+
+
+/**
+ * Minimal read-only ContentProvider so the system package installer (API 24+)
+ * can read the downloaded APK from app-private storage via a content:// URI.
+ * Top-level on purpose: the manifest references com.cosmos.app.UpdateFileProvider
+ * directly, and a nested class would need a MainActivity\\$ suffix to inflate.
+ */
+class UpdateFileProvider : ContentProvider() {
+    override fun onCreate(): Boolean = true
+    override fun getType(uri: android.net.Uri): String = "application/vnd.android.package-archive"
+    override fun openFile(uri: android.net.Uri, mode: String): ParcelFileDescriptor {
+        if (mode != "r") throw SecurityException("read-only provider")
+        val name = uri.lastPathSegment ?: throw IllegalArgumentException("no file")
+        if (!name.endsWith(".apk")) throw IllegalArgumentException("apk only")
+        val file = File(requireNotNull(context).filesDir, "$UPDATE_APK_DIR/$name")
+        return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+    }
+    override fun query(uri: android.net.Uri, projection: Array<out String>?, selection: String?, args: Array<out String>?, order: String?): Cursor? = null
+    override fun insert(uri: android.net.Uri, values: ContentValues?): android.net.Uri? = null
+    override fun delete(uri: android.net.Uri, selection: String?, args: Array<out String>?): Int = 0
+    override fun update(uri: android.net.Uri, values: ContentValues?, selection: String?, args: Array<out String>?): Int = 0
+}
+
