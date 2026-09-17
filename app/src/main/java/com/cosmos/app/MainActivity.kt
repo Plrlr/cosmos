@@ -63,6 +63,9 @@ private const val PREF_LAST_CHECK_MS = "last_update_check_ms"
 private const val PREF_LAST_SEEN_ARTIFACT = "last_seen_artifact_id"
 private const val PREF_SKIPPED_ARTIFACT = "skipped_artifact_id"
 private const val UPDATE_CHECK_INTERVAL_MS = 30L * 60L * 1000L
+private const val CHAT_CODE_RATE_LIMIT = 1302
+private const val CHAT_CODE_OVERLOAD = 1305
+private const val CHAT_CODE_USAGE = 1308
 
 
 /**
@@ -362,7 +365,7 @@ class MainActivity : Activity() {
      * without them and flags the outcome so the UI can add a note bubble.
      */
     private fun runChatRequest(key: String, model: String, messages: JSONArray) {
-        val outcome = try {
+        var outcome = try {
             val first = postChatCompletion(key, model, messages, withTools = true)
             when {
                 first.httpCode in 200..299 -> parseChatReply(first.body)
@@ -379,6 +382,24 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             // Transport failures: DNS, connect/read timeout, refused, etc.
             ChatOutcome(null, null, CHAT_ERROR_NETWORK, e.message ?: e.javaClass.simpleName, false)
+        }
+        // Retry with backoff: Z.ai signals rate limits / overload via HTTP 429 or
+        // business codes 1302/1305/1308. Three attempts total (2s, then 5s).
+        var attempts = 1
+        while (attempts < 3 && outcome.reply == null && outcome.errorCode != null &&
+            (outcome.errorCode == 429 || outcome.errorCode == CHAT_CODE_RATE_LIMIT ||
+                outcome.errorCode == CHAT_CODE_OVERLOAD || outcome.errorCode == CHAT_CODE_USAGE ||
+                outcome.errorCode in 500..599)) {
+            val delayMs = if (attempts == 1) 2000L else 5000L
+            try { Thread.sleep(delayMs) } catch (e: InterruptedException) { break }
+            attempts++
+            outcome = try {
+                val again = postChatCompletion(key, model, messages, withTools = true)
+                if (again.httpCode in 200..299) parseChatReply(again.body)
+                else ChatOutcome(null, null, again.httpCode, apiErrorMessage(again.body), false)
+            } catch (e: Exception) {
+                ChatOutcome(null, null, CHAT_ERROR_NETWORK, e.message ?: e.javaClass.simpleName, false)
+            }
         }
         runOnUiThread { onChatOutcome(outcome) }
     }
@@ -404,6 +425,8 @@ class MainActivity : Activity() {
             // Missing/revoked credentials: point at the Key dialog.
             401, 403 -> getString(R.string.chat_api_error, outcome.errorCode, detail) +
                 "\n\n" + getString(R.string.chat_key_error_hint)
+            429, CHAT_CODE_RATE_LIMIT, CHAT_CODE_OVERLOAD, CHAT_CODE_USAGE ->
+                getString(R.string.chat_rate_limited)
             else -> getString(R.string.chat_api_error, outcome.errorCode, detail)
         }
         addErrorBubble(message)

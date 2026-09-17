@@ -37,5 +37,6 @@
     <string name="update_banner">Update available — %1$s · tap to install</string>
     <string name="update_downloading">Downloading… %1$d%%</string>
     <string name="update_skip">✕</string>
+    <string name="chat_rate_limited">The AI service is busy right now (rate limit). I retried automatically — please try again in a minute.</string>
     <string name="update_install_failed">Couldn&#8217;t open the installer.</string>
 </resources>
