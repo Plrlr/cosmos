@@ -831,12 +831,15 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Load the newest *.html report into the report view. Reports are named
-     * YYYY-MM-DD.html; newest by modification time also handles a leftover
-     * report from an earlier run today.
+     * Load the newest report into the report view. Only files named like a
+     * report count: history.html is rewritten *after* the report on every run,
+     * so a plain "newest .html" test handed the WebView the back-issues index
+     * and quietly made that the app's home screen. Among real reports, newest
+     * by modification time is still the right pick when an earlier run today
+     * left one behind.
      */
     private fun displayNewestReport(outputDir: File) {
-        val newest = outputDir.listFiles { f -> f.isFile && f.name.endsWith(".html") }
+        val newest = outputDir.listFiles { f -> f.isFile && ISSUE_NAME.matches(f.name) }
             ?.maxByOrNull { it.lastModified() }
         if (newest != null) {
             loadingPanel.visibility = View.GONE
@@ -880,8 +883,10 @@ class MainActivity : Activity() {
                 clear()
                 set(year.toInt(), month.toInt() - 1, day.toInt())
             }
-            val label = humanDate.format(date.time)
-            val prefix = if (file.name == todayName) "Today - " else ""
+            // Upper case on purpose: this is the index the reader scans, and
+            // it reads as TODAY - THURSDAY, SEPTEMBER 17, 2026.
+            val label = humanDate.format(date.time).uppercase(Locale.getDefault())
+            val prefix = if (file.name == todayName) "TODAY - " else ""
             entries.append("""<li><a href="${file.name}">$prefix$label</a></li>""")
         }
 
