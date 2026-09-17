@@ -28,8 +28,18 @@ import android.widget.ScrollView
 import android.widget.TextView
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
+import android.content.ContentProvider
+import android.content.ContentValues
+import android.content.Intent
+import android.database.Cursor
+import android.net.ParseException
+import android.os.ParcelFileDescriptor
+import android.widget.Toast
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.FileOutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
@@ -83,6 +93,9 @@ class MainActivity : Activity() {
     private lateinit var chatList: LinearLayout
     private lateinit var chatInput: EditText
     private lateinit var chatSend: TextView
+    private lateinit var updateBanner: View
+    private lateinit var updateBannerText: TextView
+    private lateinit var updateSkip: TextView
 
     /** The session's conversation turns, in order: "user" and "assistant". */
     private val chatHistory = ArrayList<ChatTurn>()
@@ -126,8 +139,18 @@ class MainActivity : Activity() {
         chatList = findViewById(R.id.chatList)
         chatInput = findViewById(R.id.chatInput)
         chatSend = findViewById(R.id.chatSend)
+        updateBanner = findViewById(R.id.updateBanner)
+        updateBannerText = findViewById(R.id.updateBannerText)
+        updateSkip = findViewById(R.id.updateSkip)
         findViewById<View>(R.id.chatClose).setOnClickListener { closeChat() }
         findViewById<View>(R.id.chatKey).setOnClickListener { showKeyDialog(showHint = false) }
+        updateBannerText.setOnClickListener { startUpdateDownload() }
+        updateSkip.setOnClickListener {
+            val skippedId = updateArtifactId?.toString() ?: ""
+            getSharedPreferences(CHAT_PREFS_NAME, MODE_PRIVATE).edit()
+                .putString(PREF_SKIPPED_ARTIFACT, skippedId).apply()
+            updateBanner.visibility = View.GONE
+        }
         chatSend.setOnClickListener { sendChatMessage() }
 
         // Resize the window for the soft keyboard so the chat input row and
@@ -137,6 +160,7 @@ class MainActivity : Activity() {
         // Starting Python and running the pipeline both block, so do it off
         // the UI thread; the completion path hops back via runOnUiThread().
         Thread(::runPipeline, "cosmos-pipeline").start()
+        checkForUpdate()
     }
 
     private fun configureWebView() {
@@ -827,7 +851,172 @@ class MainActivity : Activity() {
     /** Raw status line of one HTTP exchange with the chat API. */
     private class ChatHttpResponse(val httpCode: Int, val body: String)
 
+
+    // ------------------------------------------------------------------
+    // Auto-update: check GitHub Actions artifacts (public repo, token-free),
+    // banner when a new build exists, download + offer install.
+    // ------------------------------------------------------------------
+
+    private fun checkForUpdate() {
+        val prefs = getSharedPreferences(CHAT_PREFS_NAME, MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        val last = prefs.getLong(PREF_LAST_CHECK_MS, 0L)
+        if (now - last < UPDATE_CHECK_INTERVAL_MS) return
+        prefs.edit().putLong(PREF_LAST_CHECK_MS, now).apply()
+        try {
+            val conn = urlConnection(UPDATE_ARTIFACTS_URL)
+            val body = conn.inputStream.use { it.readBytes() }.toString(Charsets.UTF_8)
+            conn.disconnect()
+            val arr = org.json.JSONArray(body)
+            var newest: org.json.JSONObject? = null
+            for (i in 0 until arr.length()) {
+                val a = arr.getJSONObject(i)
+                if (a.optString("name") == UPDATE_ARTIFACT_NAME && !a.optBoolean("expired", false)) {
+                    val cur = newest
+                    if (cur == null || a.optLong("id", 0) > cur.optLong("id", 0)) newest = a
+                }
+            }
+            val artifact = newest ?: return
+            val id = artifact.optLong("id", 0)
+            if (id == 0L || id.toString() == prefs.getString(PREF_SKIPPED_ARTIFACT, null)) return
+            val label = artifact.updatedAtShort() // "build <date>"
+            if (id.toString() == prefs.getString(PREF_LAST_SEEN_ARTIFACT, null)) return // already offered
+            prefs.edit().putString(PREF_LAST_SEEN_ARTIFACT, id.toString()).apply()
+            runOnUiThread {
+                updateArtifactId = id
+                updateBannerText.text = getString(R.string.update_banner, label)
+                updateBanner.visibility = View.VISIBLE
+            }
+        } catch (t: Throwable) {
+            // Silent: no network, rate limit, parse hiccup — never nag the user.
+        }
+    }
+
+    private fun org.json.JSONObject.updatedAtShort(): String {
+        // "2026-09-17T00:13:27Z" -> "build Sep 17"
+        val raw = optString("updated_at")
+        val datePart = raw.takeIf { it.length >= 10 }?.substring(0, 10) ?: return "latest build"
+        return try {
+            val inFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            val outFmt = SimpleDateFormat("MMM d", Locale.US)
+            "build " + outFmt.format(inFmt.parse(datePart)!!)
+        } catch (e: ParseException) {
+            "latest build"
+        }
+    }
+
+    private fun startUpdateDownload() {
+        val id = updateArtifactId ?: return
+        updateBannerText.text = getString(R.string.update_downloading, 0)
+        Thread({
+            try {
+                val zip = File(cacheDir, UPDATE_ZIP_NAME)
+                val conn = urlConnection("$UPDATE_BASE_URL$UPDATE_ARTIFACTS_PATH/$id/zip")
+                val total = conn.contentLengthLong
+                conn.inputStream.use { input ->
+                    zip.outputStream().use { out ->
+                        val buf = ByteArray(64 * 1024)
+                        var read = 0L
+                        var lastPct = -1
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            out.write(buf, 0, n)
+                            read += n
+                            if (total > 0) {
+                                val pct = (read * 100 / total).toInt()
+                                if (pct != lastPct) {
+                                    lastPct = pct
+                                    runOnUiThread { updateBannerText.text = getString(R.string.update_downloading, pct) }
+                                }
+                            }
+                        }
+                    }
+                }
+                val apk = File(filesDir, UPDATE_APK_PATH)
+                apk.parentFile?.mkdirs()
+                extractApk(zip, apk)
+                zip.delete()
+                runOnUiThread { launchInstaller(apk) }
+            } catch (t: Throwable) {
+                runOnUiThread {
+                    Toast.makeText(this, getString(R.string.update_install_failed), Toast.LENGTH_SHORT).show()
+                    updateBannerText.text = getString(R.string.update_banner, "latest build")
+                }
+            }
+        }, "cosmos-update").start()
+    }
+
+    private fun extractApk(zip: File, target: File) {
+        ZipInputStream(zip.inputStream()).use { zin ->
+            while (true) {
+                val entry: ZipEntry = zin.nextEntry ?: break
+                if (entry.name.endsWith(".apk")) {
+                    FileOutputStream(target).use { out -> zin.copyTo(out) }
+                    return
+                }
+                zin.closeEntry()
+            }
+        }
+        throw IllegalStateException("No APK inside the artifact")
+    }
+
+    private fun launchInstaller(apk: File) {
+        try {
+            val uri = Uri.parse("content://${UPDATE_AUTHORITY}/update/${apk.name}")
+            val intent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+        } catch (t: Throwable) {
+            Toast.makeText(this, getString(R.string.update_install_failed), Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun urlConnection(url: String): HttpURLConnection {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.connectTimeout = 15000
+        conn.readTimeout = 120000
+        conn.setRequestProperty("User-Agent", "cosmos-app")
+        return conn
+    }
+
+    /**
+     * Minimal read-only provider so the package installer (API 24+) can read
+     * the downloaded APK from app-private storage via a content:// URI.
+     */
+    class UpdateFileProvider : ContentProvider() {
+        override fun onCreate(): Boolean = true
+        override fun getType(uri: android.net.Uri): String = "application/vnd.android.package-archive"
+        override fun openFile(uri: android.net.Uri, mode: String): ParcelFileDescriptor {
+            if (mode != "r") throw SecurityException("read-only provider")
+            val name = uri.lastPathSegment ?: throw IllegalArgumentException("no file")
+            if (!name.endsWith(".apk")) throw IllegalArgumentException("apk only")
+            val file = File(requireNotNull(context).filesDir, "$UPDATE_APK_DIR/$name")
+            return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+        }
+        override fun query(uri: android.net.Uri, projection: Array<out String>?, selection: String?, args: Array<out String>?, order: String?): Cursor? = null
+        override fun insert(uri: android.net.Uri, values: ContentValues?): android.net.Uri? = null
+        override fun delete(uri: android.net.Uri, selection: String?, args: Array<out String>?): Int = 0
+        override fun update(uri: android.net.Uri, values: ContentValues?, selection: String?, args: Array<out String>?): Int = 0
+    }
+
     private companion object {
+        private const val UPDATE_ARTIFACTS_URL = "https://api.github.com/repos/Plrlr/cosmos/actions/artifacts?per_page=5"
+        private const val UPDATE_BASE_URL = "https://api.github.com/repos/Plrlr/cosmos/actions"
+        private const val UPDATE_ARTIFACTS_PATH = "artifacts"
+        private const val UPDATE_ARTIFACT_NAME = "cosmos-debug-apk"
+        private const val UPDATE_AUTHORITY = "com.cosmos.app.update"
+        private const val UPDATE_ZIP_NAME = "cosmos-update.zip"
+        private const val UPDATE_APK_DIR = "update"
+        private const val UPDATE_APK_PATH = "update/app-debug.apk"
+        private const val PREF_LAST_CHECK_MS = "last_update_check_ms"
+        private const val PREF_LAST_SEEN_ARTIFACT = "last_seen_artifact_id"
+        private const val PREF_SKIPPED_ARTIFACT = "skipped_artifact_id"
+        private const val UPDATE_CHECK_INTERVAL_MS = 30L * 60L * 1000L
+        private var updateArtifactId: Long? = null
         // --- GLM chat ("Search") constants ---
 
         /** Z.ai OpenAI-compatible chat completions endpoint. */

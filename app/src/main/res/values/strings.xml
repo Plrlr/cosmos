@@ -32,4 +32,10 @@
     <string name="chat_network_error">Network error: %1$s</string>
     <string name="chat_empty_reply">The model returned an empty or unreadable reply.</string>
     <string name="chat_key_error_hint">Check your API key (Key button above).</string>
+
+    <!-- Auto-update banner -->
+    <string name="update_banner">Update available — %1$s · tap to install</string>
+    <string name="update_downloading">Downloading… %1$d%%</string>
+    <string name="update_skip">✕</string>
+    <string name="update_install_failed">Couldn&#8217;t open the installer.</string>
 </resources>
