@@ -19,6 +19,10 @@ from pathlib import Path
 #: __init__ (version), cli, core, geometry, sources.
 RUNTIME_MODULES = ("__init__.py", "cli.py", "core.py", "geometry.py", "sources.py")
 
+#: Docs that live at the package root but belong in the repository too, so the
+#: copy published on GitHub cannot drift from the one next to the code.
+DOCS = ("MATHEMATICS.md",)
+
 
 def main() -> int:
     android = Path(__file__).resolve().parent
@@ -31,6 +35,11 @@ def main() -> int:
     for name in RUNTIME_MODULES:
         shutil.copyfile(src / name, dst / name)
     print(f"Synced {len(RUNTIME_MODULES)} modules: {src} -> {dst}")
+    for name in DOCS:
+        source = src / name
+        if source.is_file():
+            shutil.copyfile(source, android / name)
+            print(f"Synced {name} -> {android / name}")
     return 0
 
 

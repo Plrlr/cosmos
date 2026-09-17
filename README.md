@@ -22,6 +22,13 @@ internal (never shown to the user) and is deliberately unchanged.
   Python's stdout/stderr also land in logcat under the tags `python.stdout` and
   `python.stderr`.
 
+## The mathematics
+
+The ranking and selection model — deficits, the fitted metric, the selection
+ball, the determinantal spread test, and every constant that is a choice rather
+than a theorem — is derived from scratch in [MATHEMATICS.md](MATHEMATICS.md), with
+the figures a real run against the current source catalog produces.
+
 ## Version matrix (exact, mutually compatible)
 
 | Component              | Version   | Why it fits                                              |
