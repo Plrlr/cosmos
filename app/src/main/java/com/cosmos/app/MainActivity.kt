@@ -120,7 +120,7 @@ class MainActivity : Activity() {
     /** True while a chat request is in flight; guards the Send button. */
     private var chatRequestInFlight = false
 
-    /** The transient "ThinkingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" bubble, removed when the reply lands. */
+    /** The transient "Thinking..." bubble, removed when the reply lands. */
     private var chatThinkingView: TextView? = null
 
     /**
@@ -404,7 +404,7 @@ class MainActivity : Activity() {
         runOnUiThread { onChatOutcome(outcome) }
     }
 
-    /** UI-thread completion: swap the "ThinkingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" bubble for the reply/error. */
+    /** UI-thread completion: swap the "Thinking..." bubble for the reply/error. */
     private fun onChatOutcome(outcome: ChatOutcome) {
         chatRequestInFlight = false
         chatSend.isEnabled = true
@@ -610,7 +610,7 @@ class MainActivity : Activity() {
         bubble.setTextColor(BUBBLE_MUTED_COLOR)
     }
 
-    /** Transient "ThinkingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" placeholder; kept so it can be removed later. */
+    /** Transient "Thinking..." placeholder; kept so it can be removed later. */
     private fun addThinkingBubble(): TextView {
         val bubble = addChatBubble(getString(R.string.chat_thinking), fromUser = false)
         bubble.setTextColor(BUBBLE_MUTED_COLOR)
@@ -849,7 +849,7 @@ class MainActivity : Activity() {
                 set(year.toInt(), month.toInt() - 1, day.toInt())
             }
             val label = humanDate.format(date.time)
-            val prefix = if (file.name == todayName) "Today Ãƒâ€šÃ‚Â· " else ""
+            val prefix = if (file.name == todayName) "Today - " else ""
             entries.append("""<li><a href="${file.name}">$prefix$label</a></li>""")
         }
 
@@ -939,7 +939,7 @@ class MainActivity : Activity() {
                 updateBanner.visibility = View.VISIBLE
             }
         } catch (t: Throwable) {
-            // Silent: no network, rate limit, parse hiccup ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â never nag the user.
+        // Silent: no network, rate limit, parse hiccup - never nag the user.
         }
     }
 
