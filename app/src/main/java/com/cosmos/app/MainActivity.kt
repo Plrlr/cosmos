@@ -421,6 +421,9 @@ class MainActivity : Activity() {
         payload.put("stream", false)
         payload.put("temperature", 0.6)
         payload.put("max_tokens", 2048)
+        // glm-4.7-flash supports explicit thinking control; disable it for
+        // fast conversational replies (verified against docs.z.ai schema).
+        payload.put("thinking", JSONObject().put("type", "disabled"))
 
         val connection = URL(CHAT_API_URL).openConnection() as HttpURLConnection
         try {
